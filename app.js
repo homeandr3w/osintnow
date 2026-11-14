@@ -1,1312 +1,922 @@
-/* osintnow. - application logic
-   Everything runs client-side. Third-party data is only ever inserted with
-   textContent / DOM nodes (never innerHTML), so API responses cannot inject markup. */
+/* osintnow. — client-side OSINT toolkit. Only free, public, no-key sources. */
 (() => {
   'use strict';
 
   /* =====================================================================
-     Small utilities
+     Utilities
      ===================================================================== */
-  const $ = (sel, root = document) => root.querySelector(sel);
+  const $ = (s, r = document) => r.querySelector(s);
+  const enc = encodeURIComponent;
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  function safeUrl(url) {
-    try {
-      const u = new URL(url);
-      return /^https?:$/.test(u.protocol) ? u.href : null;
-    } catch { return null; }
-  }
-
-  function append(el, kids) {
-    for (const k of kids) {
-      if (k == null || k === false) continue;
-      if (Array.isArray(k)) append(el, k);
-      else el.append(k instanceof Node ? k : document.createTextNode(String(k)));
-    }
-  }
-
-  /** Tiny hyperscript helper. */
   function h(tag, props, ...kids) {
     const el = document.createElement(tag);
-    if (props) {
-      for (const [k, v] of Object.entries(props)) {
-        if (v == null || v === false) continue;
-        if (k === 'class') el.className = v;
-        else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
-        else if (k === 'href') { const u = safeUrl(v); if (u) el.setAttribute('href', u); }
-        else el.setAttribute(k, v === true ? '' : String(v));
-      }
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k === 'style') el.style.cssText = v;
+      else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v === true ? '' : String(v));
     }
-    append(el, kids);
+    for (const kid of kids.flat(Infinity)) {
+      if (kid == null || kid === false) continue;
+      el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+    }
     return el;
   }
 
-  const p = (...kids) => h('p', null, ...kids);
-  const sleep = (ms, signal) => new Promise((resolve, reject) => {
-    if (signal && signal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
-    const t = setTimeout(resolve, ms);
-    if (signal) signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
-  });
+  const ext = (url, text, cls = 'inline') => h('a', { href: url, target: '_blank', rel: 'noopener noreferrer', class: cls, text: text || url });
 
-  function svg(inner, size = 22) {
-    const t = document.createElement('template');
-    t.innerHTML = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
-    return t.content.firstElementChild;
-  }
-
-  const dateFmt = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' });
-  function fmtDate(value) {
-    const d = new Date(value);
-    return Number.isNaN(d.getTime()) ? String(value) : dateFmt.format(d);
-  }
-  const num = (n) => (typeof n === 'number' ? n.toLocaleString('en-US') : String(n));
-
-  let regionNames = null;
-  try { regionNames = new Intl.DisplayNames(['en-US'], { type: 'region' }); } catch { /* unsupported */ }
-  function countryName(code) {
-    if (!code) return '';
-    try { return (regionNames && regionNames.of(code.toUpperCase())) || code; } catch { return code; }
-  }
-  function flagEmoji(code) {
-    if (!/^[A-Za-z]{2}$/.test(code || '')) return '';
-    return String.fromCodePoint(...[...code.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
-  }
-
-  async function copyText(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      const ta = h('textarea', { 'aria-hidden': 'true', style: 'position:fixed;opacity:0;top:0;left:0' });
-      ta.value = text;
-      document.body.append(ta);
-      ta.select();
-      let ok = false;
-      try { ok = document.execCommand('copy'); } catch { ok = false; }
-      ta.remove();
-      return ok;
-    }
-  }
-
-  /* =====================================================================
-     Settings (optional API keys, kept in localStorage only)
-     ===================================================================== */
-  const Settings = {
-    keys: { intelx: 'osintnow.intelx', intelxHost: 'osintnow.intelxHost', ipinfo: 'osintnow.ipinfo' },
-    read(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
-    write(k, v) { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch { /* storage blocked */ } },
-    get() {
-      return {
-        intelx: this.read(this.keys.intelx).trim(),
-        intelxHost: this.read(this.keys.intelxHost) || 'free.intelx.io',
-        ipinfo: this.read(this.keys.ipinfo).trim(),
-      };
-    },
+  const store = {
+    get(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }
   };
 
-  /* =====================================================================
-     Networking
-     ===================================================================== */
-  async function fetchJSON(url, opts = {}) {
-    const { timeout = 12000, signal, ...init } = opts;
-    const ctrl = new AbortController();
-    let timedOut = false;
-    const onAbort = () => ctrl.abort();
-    if (signal) {
-      if (signal.aborted) ctrl.abort();
-      else signal.addEventListener('abort', onAbort, { once: true });
-    }
-    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeout);
+  async function fetchStatus(url, { timeout = 10000, headers } = {}) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeout);
     try {
-      const res = await fetch(url, { ...init, signal: ctrl.signal, credentials: 'omit', referrerPolicy: 'no-referrer' });
-      const text = await res.text();
+      const r = await fetch(url, { signal: ctl.signal, cache: 'no-store', headers });
       let data = null;
-      let parsed = false;
-      try { data = text ? JSON.parse(text) : null; parsed = true; } catch { /* not JSON */ }
-      if (!res.ok) {
-        const err = new Error(`HTTP ${res.status}`);
-        err.status = res.status;
-        err.data = data;
-        throw err;
-      }
-      if (!parsed) throw new Error('The service returned an unreadable response.');
-      return data;
-    } catch (err) {
-      if (err.status) throw err;
-      if (timedOut) { const e = new Error('timeout'); e.timeout = true; throw e; }
-      if (signal && signal.aborted) throw err;
-      if (err instanceof TypeError) { const e = new Error('network'); e.network = true; throw e; }
-      throw err;
-    } finally {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onAbort);
-    }
-  }
-
-  function explain(err) {
-    if (!err) return 'Unknown error.';
-    if (err.timeout) return 'The service took too long to respond.';
-    if (err.status === 429) return 'Rate limit reached. Wait a minute and try again.';
-    if (err.status === 401 || err.status === 402) return 'The service rejected the request (invalid key or quota used up).';
-    if (err.status === 403) return 'The service refused the request (access blocked or a key is required).';
-    if (err.status === 404) return 'Nothing found.';
-    if (err.status) return `The service answered with an error (HTTP ${err.status}).`;
-    if (err.network) return 'The request was blocked: you may be offline, using a blocker, or the service does not allow browser access.';
-    return err.message || 'Unknown error.';
-  }
-
-  /* DNS over HTTPS (Google first, Cloudflare as fallback) */
-  const DNS_TYPES = { A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16, AAAA: 28, CAA: 257 };
-  async function doh(name, type, signal) {
-    const code = DNS_TYPES[type];
-    let data;
-    try {
-      data = await fetchJSON(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`, { signal, timeout: 9000 });
+      try { data = await r.json(); } catch { /* not JSON */ }
+      return { status: r.status, data };
     } catch (e) {
-      if (signal && signal.aborted) throw e;
-      data = await fetchJSON(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`, {
-        signal, timeout: 9000, headers: { accept: 'application/dns-json' },
-      });
+      if (e && e.name === 'AbortError') throw new Error('Request timed out.');
+      throw new Error('Could not reach the service (network error, blocked by CORS, or the service is down).');
+    } finally {
+      clearTimeout(t);
     }
-    const answers = (data.Answer || []).filter((a) => a.type === code).map((a) => ({ ttl: a.TTL, data: cleanDns(type, a.data) }));
-    return { status: data.Status, answers };
-  }
-  function cleanDns(type, value) {
-    let v = String(value);
-    if (type === 'TXT') return v.replace(/^"|"$/g, '').replace(/"\s+"/g, '');
-    if (['NS', 'CNAME', 'PTR', 'MX'].includes(type)) v = v.replace(/\.$/, '');
-    if (type === 'SOA') v = v.replace(/\.(?=\s)/g, '');
-    return v;
   }
 
-  /* =====================================================================
-     IP helpers
-     ===================================================================== */
-  const isIPv4 = (s) => /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(s);
-  function isIPv6(s) {
-    if (!s.includes(':') || !/^[0-9a-f:.]+$/i.test(s)) return false;
-    try { new URL(`http://[${s}]/`); return true; } catch { return false; }
+  async function fetchJSON(url, opts) {
+    const r = await fetchStatus(url, opts);
+    if (r.status === 429) throw new Error('Rate limit reached for this free service. Try again in a minute.');
+    if (r.status < 200 || r.status >= 300) throw new Error(`The service answered with HTTP ${r.status}.`);
+    if (r.data == null) throw new Error('The service returned an unexpected response.');
+    return r.data;
   }
-  function expandIPv6(ip) {
-    let s = ip.toLowerCase();
-    if (s.includes('.')) {
-      const i = s.lastIndexOf(':');
-      const v = s.slice(i + 1).split('.').map(Number);
-      s = `${s.slice(0, i + 1)}${((v[0] << 8) | v[1]).toString(16)}:${((v[2] << 8) | v[3]).toString(16)}`;
-    }
-    const [head, tail] = s.split('::');
-    const a = head ? head.split(':') : [];
-    const b = tail ? tail.split(':') : [];
-    const fill = s.includes('::') ? 8 - a.length - b.length : 0;
-    return [...a, ...Array(Math.max(fill, 0)).fill('0'), ...b].map((x) => x.padStart(4, '0')).join('');
+
+  const fmtDate = s => { const d = new Date(s); return isNaN(d) ? String(s) : d.toISOString().slice(0, 10); };
+  const daysSince = s => { const d = new Date(s); return isNaN(d) ? null : Math.floor((Date.now() - d.getTime()) / 864e5); };
+  const regionName = cc => { try { return new Intl.DisplayNames(['en-US'], { type: 'region' }).of(cc.toUpperCase()) || cc; } catch { return cc; } };
+  const flag = cc => /^[A-Za-z]{2}$/.test(cc || '') ? String.fromCodePoint(...[...cc.toUpperCase()].map(c => 127397 + c.charCodeAt(0))) : '';
+  const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } };
+  const gsearch = q => `https://www.google.com/search?q=${enc(q)}`;
+
+  /* ----- validators ----- */
+  const isIPv4 = v => /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(v);
+  const isIPv6 = v => { if (!v.includes(':') || /[\s/\\?#@]/.test(v)) return false; try { new URL(`http://[${v}]`); return true; } catch { return false; } };
+  const isDomain = v => /^(?=.{1,253}$)([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9-]{2,63}$/.test(v) && !/^[\d.]+$/.test(v);
+  const isEmail = v => /^[^\s@<>()[\]\\,;:"]{1,64}@([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/i.test(v) && v.length <= 254;
+  function normDomain(v) {
+    let s = v.trim().toLowerCase();
+    if (!s) return null;
+    try { s = new URL(s.includes('://') ? s : `http://${s}`).hostname; } catch { return null; }
+    s = s.replace(/\.$/, '');
+    return isDomain(s) ? s : null;
   }
+
   function reverseName(ip) {
     if (isIPv4(ip)) return `${ip.split('.').reverse().join('.')}.in-addr.arpa`;
-    return `${expandIPv6(ip).split('').reverse().join('.')}.ip6.arpa`;
-  }
-  function isPrivateIp(ip) {
-    if (isIPv4(ip)) {
-      const [a, b] = ip.split('.').map(Number);
-      return a === 0 || a === 10 || a === 127 || a >= 224 ||
-        (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
-        (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
-        (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19));
-    }
-    const x = expandIPv6(ip);
-    return /^0{31}[01]$/.test(x) || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || x.startsWith('ff');
+    const clean = ip.split('%')[0];
+    const [l, r] = clean.split('::');
+    const L = l ? l.split(':') : [];
+    const R = r ? r.split(':') : [];
+    const fill = clean.includes('::') ? 8 - L.length - R.length : 0;
+    const parts = [...L, ...Array(Math.max(fill, 0)).fill('0'), ...R].map(p => p.padStart(4, '0'));
+    if (parts.length !== 8 || parts.some(p => !/^[0-9a-f]{4}$/i.test(p))) throw new Error('Unsupported IPv6 notation for reverse lookup.');
+    return `${parts.join('').split('').reverse().join('.')}.ip6.arpa`;
   }
 
-  function normalizeDomain(raw) {
-    let v = raw.trim().toLowerCase();
-    if (!v) throw new Error('Enter a domain name, for example example.com.');
-    if (!/^[a-z][a-z0-9+.-]*:\/\//.test(v)) v = `http://${v}`;
-    let host;
-    try { host = new URL(v).hostname.replace(/\.$/, ''); } catch { throw new Error('That does not look like a valid domain name.'); }
-    if (isIPv4(host)) throw new Error('That is an IP address. Use the IP/DNS Analysis module instead.');
-    if (!/^(?=.{1,253}$)([a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9-]{2,63}$/.test(host)) {
-      throw new Error('That does not look like a valid domain name.');
+  /* ----- DNS over HTTPS (Cloudflare, falling back to Google) ----- */
+  const RTYPES = { 1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 12: 'PTR', 15: 'MX', 16: 'TXT', 28: 'AAAA', 257: 'CAA' };
+  const cleanTxt = s => String(s).replace(/^"|"$/g, '').replace(/"\s+"/g, '');
+  async function doh(name, type) {
+    const q = `name=${enc(name)}&type=${type}`;
+    let last;
+    for (const u of [`https://cloudflare-dns.com/dns-query?${q}`, `https://dns.google/resolve?${q}`]) {
+      try {
+        const data = await fetchJSON(u, { headers: { accept: 'application/dns-json' }, timeout: 8000 });
+        return {
+          status: data.Status,
+          answers: (data.Answer || []).map(a => {
+            const t = RTYPES[a.type] || String(a.type);
+            return { name: a.name, type: t, ttl: a.TTL, data: t === 'TXT' ? cleanTxt(a.data) : String(a.data).replace(/\.$/, '') };
+          })
+        };
+      } catch (e) { last = e; }
     }
-    return host;
+    throw last || new Error('DNS lookup failed.');
   }
 
   /* =====================================================================
      UI building blocks
      ===================================================================== */
   function kv(rows) {
-    const items = rows.filter(([, v]) => v !== undefined && v !== null && v !== '' && v !== false);
-    if (!items.length) return p(h('span', { class: 'muted' }, 'No details available.'));
-    return h('dl', { class: 'kv' }, items.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
-  }
-  const chips = (list, mono = false) =>
-    h('div', { class: 'chips' }, list.map((t) => h('span', { class: `chip${mono ? ' mono' : ''}` }, t)));
-  const linkChips = (list) =>
-    h('div', { class: 'chips' }, list.map(([label, url]) =>
-      h('a', { class: 'link', href: url, target: '_blank', rel: 'noopener noreferrer' }, label)));
-  const mutedP = (t) => h('p', { class: 'muted small' }, t);
-  const extLink = (label, url) => h('a', { class: 'link', href: url, target: '_blank', rel: 'noopener noreferrer' }, label);
-
-  function googleUrl(q) { return `https://www.google.com/search?q=${encodeURIComponent(q)}`; }
-
-  function dorksList(queries) {
-    return h('ul', { class: 'dorks' }, queries.map((q) => {
-      const copy = h('button', { class: 'link', type: 'button' }, 'Copy');
-      copy.addEventListener('click', async () => {
-        const ok = await copyText(q);
-        copy.textContent = ok ? 'Copied' : 'Copy failed';
-        setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
-      });
-      return h('li', null,
-        h('code', null, q),
-        h('div', { class: 'actions' }, extLink('Search', googleUrl(q)), copy));
-    }));
-  }
-
-  function recordsView(map) {
-    const rows = Object.entries(map).filter(([, list]) => list.length);
-    if (!rows.length) return mutedP('No records found.');
-    return h('div', { class: 'records' }, rows.map(([type, list]) =>
-      h('div', { class: 'rec' },
-        h('span', { class: 'tag' }, type),
-        h('ul', null, list.map((r) => h('li', null, r.data, h('small', null, `TTL ${r.ttl}s`)))))));
-  }
-
-  /* =====================================================================
-     Run context: cards, abort handling, memoised DNS
-     ===================================================================== */
-  let runSeq = 0;
-  let currentRun = null;
-
-  function makeCtx(run, host) {
-    const keys = Settings.get();
-    const dnsCache = new Map();
-    let n = 0;
-    const alive = () => currentRun === run && !run.ctrl.signal.aborted;
-    const json = (url, opts = {}) => fetchJSON(url, { signal: run.ctrl.signal, ...opts });
-
-    function makeCard(title) {
-      const status = h('span', { class: 'status' }, 'Loading');
-      let body = h('div', { class: 'card-body' }, h('div', { class: 'skeleton' }), h('div', { class: 'skeleton short' }));
-      const el = h('article', { class: 'card is-loading', style: `--i:${n++}`, 'data-state': 'loading' },
-        h('header', { class: 'card-head' }, h('h3', null, title), status), body);
-      host.append(el);
-      let settled = false;
-      const done = (state, label, nodes) => {
-        if (!alive()) return;
-        settled = true;
-        el.dataset.state = state;
-        el.classList.remove('is-loading');
-        status.textContent = label;
-        const next = h('div', { class: 'card-body' }, nodes);
-        body.replaceWith(next);
-        body = next;
-      };
-      return {
-        get settled() { return settled; },
-        ok: (nodes, label = 'Found') => done('ok', label, nodes),
-        note: (nodes, label = 'Info') => done('note', label, nodes),
-        empty: (msg, label = 'No data') => done('empty', label, [mutedP(msg)]),
-        fail: (err, label = 'Unavailable') => done('error', label, [
-          p(explain(err)),
-          err && (err.network || err.timeout) ? mutedP('Some free services limit browser access or rate-limit anonymous users. The result may work on a retry.') : null,
-        ]),
-      };
+    const dl = h('dl', { class: 'kv' });
+    for (const [k, v, mono] of rows) {
+      if (v == null || v === '' || (Array.isArray(v) && !v.length)) continue;
+      dl.append(h('dt', { text: k }), h('dd', { class: mono ? 'mono' : '' }, Array.isArray(v) ? v.map(x => h('div', {}, x)) : v));
     }
-
-    function task(title, fn) {
-      const card = makeCard(title);
-      return (async () => {
-        try {
-          await fn(card);
-          if (!card.settled) card.empty('No data returned.');
-        } catch (err) {
-          if (alive()) card.fail(err);
-        }
-      })();
-    }
-
-    function dns(name, type) {
-      const key = `${type}:${name}`;
-      if (!dnsCache.has(key)) dnsCache.set(key, doh(name, type, run.ctrl.signal));
-      return dnsCache.get(key);
-    }
-
-    return { keys, signal: run.ctrl.signal, alive, json, task, dns };
+    return dl.children.length ? dl : h('p', { class: 'note', text: 'No data returned.' });
   }
 
-  /* =====================================================================
-     Shared module pieces
-     ===================================================================== */
-  function intelxTask(ctx, term) {
-    const searchUrl = `https://intelx.io/?s=${encodeURIComponent(term)}`;
-    return ctx.task('IntelX (leaks, pastes, darknet)', async (card) => {
-      const { intelx, intelxHost } = ctx.keys;
-      if (!intelx) {
-        card.note([
-          p('Add your free IntelX API key in Settings to search leaks, pastes and darknet records from here.'),
-          h('div', { class: 'chips' },
-            h('button', { class: 'link', type: 'button', onclick: () => openSettings() }, 'Open settings'),
-            extLink('Search on intelx.io', searchUrl),
-            extLink('Get a free key', 'https://intelx.io/signup')),
-        ], 'Key needed');
-        return;
-      }
-      const base = `https://${intelxHost}/`;
-      const headers = { 'x-key': intelx, 'content-type': 'application/json' };
-      try {
-        const start = await ctx.json(`${base}intelligent/search`, {
-          method: 'POST', headers, timeout: 15000,
-          body: JSON.stringify({ term, buckets: [], lookuplevel: 0, maxresults: 50, timeout: 0, datefrom: '', dateto: '', sort: 4, media: 0, terminate: [] }),
-        });
-        if (!start || start.status !== 0 || !start.id) throw new Error('IntelX rejected this search term.');
-        const records = new Map();
-        for (let i = 0; i < 8; i++) {
-          await sleep(i === 0 ? 700 : 1100, ctx.signal);
-          const r = await ctx.json(`${base}intelligent/search/result?id=${encodeURIComponent(start.id)}&limit=50&statistics=0&previewlines=0`, { headers: { 'x-key': intelx }, timeout: 15000 });
-          for (const rec of (r && r.records) || []) records.set(rec.systemid, rec);
-          if (!r || r.status === 1 || r.status === 2 || records.size >= 50) break;
-        }
-        ctx.json(`${base}intelligent/search/terminate?id=${encodeURIComponent(start.id)}`, { headers: { 'x-key': intelx }, timeout: 5000 }).catch(() => {});
-        if (!records.size) { card.empty('IntelX has no records for this term.', 'No results'); return; }
-        const list = [...records.values()];
-        card.ok([
-          p(`${list.length}${list.length >= 50 ? '+' : ''} records found.`),
-          h('ul', { class: 'dorks scroll-list' }, list.map((r) => h('li', null,
-            h('div', null,
-              h('code', null, r.name || `Record ${String(r.systemid).slice(0, 8)}`),
-              h('small', { class: 'muted' }, ` ${[r.bucket, r.date && fmtDate(r.date)].filter(Boolean).join(' · ')}`)),
-            extLink('Open', `https://intelx.io/?did=${encodeURIComponent(r.systemid)}`)))),
-          h('div', { class: 'chips' }, extLink('All results on intelx.io', searchUrl)),
-        ], `${list.length} records`);
-      } catch (err) {
-        if (ctx.signal.aborted) throw err;
-        card.note([
-          p(explain(err)),
-          mutedP('IntelX may block direct browser requests (CORS) depending on your plan. The full search is one click away.'),
-          h('div', { class: 'chips' }, extLink('Search on intelx.io', searchUrl)),
-        ], 'Blocked');
-      }
+  function table(head, rows) {
+    return h('div', { class: 'table-wrap' },
+      h('table', {},
+        h('thead', {}, h('tr', {}, head.map(x => h('th', { text: x })))),
+        h('tbody', {}, rows.map(r => h('tr', {}, r.map(c => (c && c.nodeType) ? h('td', {}, c) : h('td', { class: 'mono', text: c })))))));
+  }
+
+  const chips = (list, mono) => h('div', { class: 'chips' }, list.map(x => h('span', { class: `chip${mono ? ' mono' : ''}`, text: x })));
+  const note = text => h('p', { class: 'note', text });
+  const src = text => h('p', { class: 'src', text });
+  const badge = (kind, text) => h('span', { class: `badge ${kind}`, text });
+
+  function linkGrid(items) {
+    return h('ul', { class: 'links' }, items.map(i => h('li', {}, h('a', { href: i.u, target: '_blank', rel: 'noopener noreferrer' }, h('strong', { text: i.t }), h('small', { text: i.d || hostOf(i.u) })))));
+  }
+
+  function panel(out, title, fn, tag, wide) {
+    const body = h('div', { class: 'body' }, h('div', { class: 'loader', 'aria-label': 'Loading' }, h('span'), h('span'), h('span')));
+    const card = h('article', { class: `card${wide ? ' wide' : ''}`, style: `--i:${Math.min(out.children.length, 10)}` },
+      h('header', { class: 'card-h' }, h('h3', { text: title }), tag ? h('span', { class: 'tag', text: tag }) : null), body);
+    out.append(card);
+    const p = Promise.resolve().then(fn)
+      .then(res => body.replaceChildren(...[].concat(typeof res === 'string' ? note(res) : res).filter(Boolean)))
+      .catch(err => body.replaceChildren(h('p', { class: 'err', text: `⚠ ${(err && err.message) || 'Lookup failed.'}` })));
+    (out._p = out._p || []).push(p);
+    return p;
+  }
+
+  async function dnsTable(host, types) {
+    const res = await Promise.allSettled(types.map(t => doh(host, t)));
+    const rows = [];
+    let ok = 0;
+    res.forEach(r => {
+      if (r.status === 'fulfilled') { ok++; r.value.answers.forEach(a => rows.push([a.type, a.data, String(a.ttl)])); }
     });
+    if (!ok) throw new Error('DNS-over-HTTPS resolvers could not be reached.');
+    if (!rows.length) return note('No records found. The name may not exist or has no public records of these types.');
+    return [table(['Type', 'Value', 'TTL'], rows), src('Source: Cloudflare / Google DNS-over-HTTPS')];
   }
 
   /* =====================================================================
-     MODULE: Username
+     Tool: Username Analysis
      ===================================================================== */
-  const enc = encodeURIComponent;
-
-  const USER_API_CHECKS = [
-    { name: 'GitHub', url: (u) => `https://github.com/${enc(u)}`, api: (u) => `https://api.github.com/users/${enc(u)}`,
-      detail: (d) => d.login && [d.name, `${num(d.public_repos)} repos`, `${num(d.followers)} followers`, d.location].filter(Boolean).join(' · ') },
-    { name: 'GitLab', url: (u) => `https://gitlab.com/${enc(u)}`, api: (u) => `https://gitlab.com/api/v4/users?username=${enc(u)}`,
-      detail: (d) => Array.isArray(d) && d[0] && (d[0].name || d[0].username) },
-    { name: 'Codeberg', url: (u) => `https://codeberg.org/${enc(u)}`, api: (u) => `https://codeberg.org/api/v1/users/${enc(u)}`,
-      detail: (d) => d && d.login && [d.full_name, d.location].filter(Boolean).join(' · ') || d.login },
-    { name: 'Reddit', url: (u) => `https://www.reddit.com/user/${enc(u)}`, api: (u) => `https://www.reddit.com/user/${enc(u)}/about.json`,
-      detail: (d) => d && d.data && d.data.name && `${num(d.data.total_karma || 0)} karma` },
-    { name: 'Hacker News', url: (u) => `https://news.ycombinator.com/user?id=${enc(u)}`, api: (u) => `https://hacker-news.firebaseio.com/v0/user/${enc(u)}.json`,
-      detail: (d) => d && d.id && `${num(d.karma || 0)} karma` },
-    { name: 'Keybase', url: (u) => `https://keybase.io/${enc(u)}`, api: (u) => `https://keybase.io/_/api/1.0/user/lookup.json?usernames=${enc(u)}`,
-      detail: (d) => d && d.them && d.them[0] && ((d.them[0].profile && d.them[0].profile.full_name) || 'Account exists') },
-    { name: 'DEV Community', url: (u) => `https://dev.to/${enc(u)}`, api: (u) => `https://dev.to/api/users/by_username?url=${enc(u)}`,
-      detail: (d) => d && d.username && [d.name, d.location].filter(Boolean).join(' · ') },
-    { name: 'Lichess', url: (u) => `https://lichess.org/@/${enc(u)}`, api: (u) => `https://lichess.org/api/user/${enc(u)}`,
-      detail: (d) => d && d.id && (d.count ? `${num(d.count.all)} games` : 'Account exists') },
-    { name: 'Chess.com', url: (u) => `https://www.chess.com/member/${enc(u)}`, api: (u) => `https://api.chess.com/pub/player/${enc(u.toLowerCase())}`,
-      detail: (d) => d && d.username && (d.name || 'Account exists') },
-    { name: 'Mastodon (mastodon.social)', url: (u) => `https://mastodon.social/@${enc(u)}`, api: (u) => `https://mastodon.social/api/v1/accounts/lookup?acct=${enc(u)}`,
-      detail: (d) => d && d.acct && `${num(d.followers_count || 0)} followers`, valid: (u) => /^\w+$/.test(u) },
-    { name: 'Bluesky', url: (u) => `https://bsky.app/profile/${enc(u)}.bsky.social`, api: (u) => `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${enc(u)}.bsky.social`,
-      detail: (d) => d && d.handle && `${num(d.followersCount || 0)} followers`, valid: (u) => /^[a-z0-9-]+$/i.test(u), missing: [400, 404] },
+  const J = (o, ...k) => k.reduce((a, x) => (a == null ? a : a[x]), o);
+  const USER_CHECKS = [
+    { n: 'GitHub', api: u => `https://api.github.com/users/${u}`, page: u => `https://github.com/${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: [d.name, d.public_repos != null && `${d.public_repos} public repos`, d.created_at && `joined ${fmtDate(d.created_at)}`].filter(Boolean).join(' · ') } : s === 404 ? { f: false } : null },
+    { n: 'GitLab', api: u => `https://gitlab.com/api/v4/users?username=${u}`, page: u => `https://gitlab.com/${u}`,
+      ok: (s, d) => s === 200 && Array.isArray(d) ? (d.length ? { f: true, i: d[0].name || '' } : { f: false }) : null },
+    { n: 'Codeberg', api: u => `https://codeberg.org/api/v1/users/${u}`, page: u => `https://codeberg.org/${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: [d.full_name, d.created && `joined ${fmtDate(d.created)}`].filter(Boolean).join(' · ') } : s === 404 ? { f: false } : null },
+    { n: 'Keybase', api: u => `https://keybase.io/_/api/1.0/user/lookup.json?usernames=${u}&fields=basics`, page: u => `https://keybase.io/${u}`,
+      ok: (s, d) => s === 200 && d ? (J(d, 'them', 0) ? { f: true, i: '' } : { f: false }) : null },
+    { n: 'Hacker News', api: u => `https://hacker-news.firebaseio.com/v0/user/${u}.json`, page: u => `https://news.ycombinator.com/user?id=${u}`,
+      ok: (s, d) => s === 200 ? (d ? { f: true, i: `${d.karma} karma · joined ${fmtDate(d.created * 1000)}` } : { f: false }) : null },
+    { n: 'DEV Community', api: u => `https://dev.to/api/users/by_username?url=${u}`, page: u => `https://dev.to/${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: [d.name, d.joined_at].filter(Boolean).join(' · ') } : s === 404 ? { f: false } : null },
+    { n: 'Docker Hub', api: u => `https://hub.docker.com/v2/users/${u}/`, page: u => `https://hub.docker.com/u/${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: d.date_joined ? `joined ${fmtDate(d.date_joined)}` : '' } : s === 404 ? { f: false } : null },
+    { n: 'Chess.com', api: u => `https://api.chess.com/pub/player/${u}`, page: u => `https://www.chess.com/member/${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: d.joined ? `joined ${fmtDate(d.joined * 1000)}` : '' } : s === 404 ? { f: false } : null },
+    { n: 'Lichess', api: u => `https://lichess.org/api/user/${u}`, page: u => `https://lichess.org/@/${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: d.createdAt ? `joined ${fmtDate(d.createdAt)}` : '' } : s === 404 ? { f: false } : null },
+    { n: 'Mastodon.social', api: u => `https://mastodon.social/api/v1/accounts/lookup?acct=${u}`, page: u => `https://mastodon.social/@${u}`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: [d.display_name, d.followers_count != null && `${d.followers_count} followers`].filter(Boolean).join(' · ') } : s === 404 ? { f: false } : null },
+    { n: 'Bluesky', valid: u => /^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$/i.test(u), api: u => `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${u}.bsky.social`, page: u => `https://bsky.app/profile/${u}.bsky.social`,
+      ok: (s, d) => s === 200 && d ? { f: true, i: [d.displayName, d.followersCount != null && `${d.followersCount} followers`].filter(Boolean).join(' · ') } : (s === 400 || s === 404) ? { f: false } : null },
+    { n: 'Reddit', api: u => `https://www.reddit.com/user/${u}/about.json`, page: u => `https://www.reddit.com/user/${u}`,
+      ok: (s, d) => s === 200 && J(d, 'data', 'name') ? { f: true, i: `${J(d, 'data', 'total_karma') ?? '?'} karma · joined ${fmtDate(d.data.created_utc * 1000)}` } : s === 404 ? { f: false } : null },
+    { n: 'Wikipedia (EN)', api: u => `https://en.wikipedia.org/w/api.php?action=query&list=users&ususers=${u}&usprop=registration%7Ceditcount&format=json&origin=*`, page: u => `https://en.wikipedia.org/wiki/User:${u}`,
+      ok: (s, d) => { const x = J(d, 'query', 'users', 0); if (s !== 200 || !x) return null; return ('missing' in x || 'invalid' in x) ? { f: false } : { f: true, i: `${x.editcount ?? 0} edits` }; } }
   ];
 
-  const USER_LINK_ONLY = [
-    ['Instagram', (u) => `https://www.instagram.com/${enc(u)}/`], ['X (Twitter)', (u) => `https://x.com/${enc(u)}`],
-    ['TikTok', (u) => `https://www.tiktok.com/@${enc(u)}`], ['YouTube', (u) => `https://www.youtube.com/@${enc(u)}`],
-    ['Twitch', (u) => `https://www.twitch.tv/${enc(u)}`], ['Telegram', (u) => `https://t.me/${enc(u)}`],
-    ['Steam', (u) => `https://steamcommunity.com/id/${enc(u)}`], ['Pinterest', (u) => `https://www.pinterest.com/${enc(u)}/`],
-    ['SoundCloud', (u) => `https://soundcloud.com/${enc(u)}`], ['Medium', (u) => `https://medium.com/@${enc(u)}`],
-    ['Snapchat', (u) => `https://www.snapchat.com/add/${enc(u)}`], ['Facebook', (u) => `https://www.facebook.com/${enc(u)}`],
-    ['Behance', (u) => `https://www.behance.net/${enc(u)}`], ['Dribbble', (u) => `https://dribbble.com/${enc(u)}`],
-    ['Patreon', (u) => `https://www.patreon.com/${enc(u)}`], ['Linktree', (u) => `https://linktr.ee/${enc(u)}`],
-    ['Flickr', (u) => `https://www.flickr.com/people/${enc(u)}`], ['Vimeo', (u) => `https://vimeo.com/${enc(u)}`],
-    ['Spotify', (u) => `https://open.spotify.com/user/${enc(u)}`], ['Roblox (search)', (u) => `https://www.roblox.com/search/users?keyword=${enc(u)}`],
+  const MANUAL_PROFILES = [
+    ['Instagram', u => `https://www.instagram.com/${u}/`], ['X / Twitter', u => `https://x.com/${u}`], ['TikTok', u => `https://www.tiktok.com/@${u}`],
+    ['YouTube', u => `https://www.youtube.com/@${u}`], ['Twitch', u => `https://www.twitch.tv/${u}`], ['Pinterest', u => `https://www.pinterest.com/${u}/`],
+    ['Telegram', u => `https://t.me/${u}`], ['Snapchat', u => `https://www.snapchat.com/add/${u}`], ['LinkedIn', u => `https://www.linkedin.com/in/${u}`],
+    ['Medium', u => `https://medium.com/@${u}`], ['Steam', u => `https://steamcommunity.com/id/${u}`], ['Spotify', u => `https://open.spotify.com/user/${u}`],
+    ['SoundCloud', u => `https://soundcloud.com/${u}`], ['Patreon', u => `https://www.patreon.com/${u}`], ['Flickr', u => `https://www.flickr.com/people/${u}`],
+    ['Vimeo', u => `https://vimeo.com/${u}`], ['Tumblr', u => `https://${u}.tumblr.com`], ['Linktree', u => `https://linktr.ee/${u}`],
+    ['About.me', u => `https://about.me/${u}`], ['Behance', u => `https://www.behance.net/${u}`], ['Dribbble', u => `https://dribbble.com/${u}`],
+    ['Replit', u => `https://replit.com/@${u}`], ['Product Hunt', u => `https://www.producthunt.com/@${u}`], ['Pastebin', u => `https://pastebin.com/u/${u}`],
+    ['Imgur', u => `https://imgur.com/user/${u}`], ['Kick', u => `https://kick.com/${u}`], ['Last.fm', u => `https://www.last.fm/user/${u}`],
+    ['Letterboxd', u => `https://letterboxd.com/${u}/`], ['Gravatar', u => `https://gravatar.com/${u}`], ['npm', u => `https://www.npmjs.com/~${u}`],
+    ['PyPI', u => `https://pypi.org/user/${u}/`], ['Hugging Face', u => `https://huggingface.co/${u}`]
   ];
 
-  async function checkPlatform(ctx, def, u) {
-    if (def.valid && !def.valid(u)) return { state: 'unknown', detail: 'Username format not valid on this platform' };
-    try {
-      const data = await ctx.json(def.api(u), { timeout: 10000 });
-      const detail = def.detail(data);
-      return detail ? { state: 'found', detail: typeof detail === 'string' ? detail : 'Account exists' } : { state: 'missing', detail: 'No account' };
-    } catch (err) {
-      if (ctx.signal.aborted) throw err;
-      if ((def.missing || [404]).includes(err.status)) return { state: 'missing', detail: 'No account' };
-      return { state: 'unknown', detail: err.status === 429 ? 'Rate limited, open to verify' : 'Could not verify, open to check' };
-    }
-  }
+  async function runUsername(input, out, ctx) {
+    const u = input.trim().replace(/^@/, '');
+    if (!/^[\w.\-]{1,40}$/.test(u)) throw new Error('Usernames can contain letters, numbers, dots, dashes and underscores (max 40 characters).');
+    const name = enc(u);
 
-  function usernameDorks(u) {
-    return [
-      `"${u}"`,
-      `intext:"${u}" -site:google.com`,
-      `inurl:"${u}"`,
-      `"${u}" site:github.com OR site:gitlab.com OR site:bitbucket.org`,
-      `"${u}" site:reddit.com OR site:news.ycombinator.com`,
-      `"${u}" site:pastebin.com OR site:ghostbin.com OR site:rentry.co`,
-      `"${u}" site:linkedin.com/in OR site:facebook.com OR site:instagram.com`,
-      `"${u}" site:twitter.com OR site:x.com OR site:t.me`,
-      `"${u}" (email OR contact OR discord OR "@gmail.com")`,
-      `"${u}" filetype:pdf OR filetype:doc OR filetype:xls`,
-    ];
-  }
+    const summary = h('p', { class: 'note', text: 'Checking platforms…' });
+    const rows = USER_CHECKS.map(c => {
+      const st = h('td', {}, badge('wait', 'Checking'));
+      const info = h('td', { text: '' });
+      return { c, st, info, tr: h('tr', {}, h('td', { text: c.n }), st, info, h('td', {}, ext(c.page(name), 'Open', 'inline'))) };
+    });
 
-  function runUsername(ctx, u) {
-    const tasks = [];
-
-    tasks.push(ctx.task('Profile check', async (card) => {
-      const list = h('ul', { class: 'checks' });
-      const marks = USER_API_CHECKS.map((def) => {
-        const mark = h('span', { class: 'mark', 'data-state': 'pending' });
-        const detail = h('span', { class: 'detail' }, 'Checking…');
-        list.append(h('li', null, mark, extLink(def.name, def.url(u)), detail));
-        return { mark, detail };
-      });
-      const counter = h('p', { class: 'muted small' }, 'Verifying public profile APIs…');
-      const linkOnly = h('div', null,
-        mutedP('These platforms block automated checks from the browser. Open each one to verify:'),
-        linkChips(USER_LINK_ONLY.map(([name, fn]) => [name, fn(u)])));
-      // Render the live list immediately so progress is visible, then settle the card.
-      card.note([counter, list, linkOnly], 'Checking');
-      let found = 0;
-      await Promise.all(USER_API_CHECKS.map(async (def, i) => {
-        const r = await checkPlatform(ctx, def, u);
-        if (!ctx.alive()) return;
-        if (r.state === 'found') found++;
-        marks[i].mark.dataset.state = r.state;
-        marks[i].detail.textContent = r.detail;
-      }));
-      if (!ctx.alive()) return;
-      counter.textContent = `Found on ${found} of ${USER_API_CHECKS.length} verifiable platforms.`;
-      // Update the status pill without rebuilding the (already rendered) list.
-      const el = list.closest('.card');
-      if (el) {
-        el.dataset.state = found ? 'ok' : 'empty';
-        $('.status', el).textContent = found ? `${found} found` : 'None found';
-      }
-    }));
-
-    tasks.push(ctx.task('Google dorks', async (card) => {
-      card.ok([
-        mutedP('Ready-made search queries that surface where this username appears. Searches open in Google.'),
-        dorksList(usernameDorks(u)),
-      ], 'Ready');
-    }));
-
-    tasks.push(ctx.task('Search engines & username databases', async (card) => {
-      card.ok([linkChips([
-        ['WhatsMyName', `https://whatsmyname.app/?q=${enc(u)}`],
-        ['Namechk', `https://namechk.com/`],
-        ['DuckDuckGo', `https://duckduckgo.com/?q=${enc(`"${u}"`)}`],
-        ['Bing', `https://www.bing.com/search?q=${enc(`"${u}"`)}`],
-        ['Yandex', `https://yandex.com/search/?text=${enc(`"${u}"`)}`],
-        ['Brave', `https://search.brave.com/search?q=${enc(`"${u}"`)}`],
-        ['Wayback: profile URLs', `https://web.archive.org/web/*/${enc(u)}*`],
-        ['GitHub code search', `https://github.com/search?q=${enc(u)}&type=code`],
-      ])], 'Links');
-    }));
-
-    tasks.push(intelxTask(ctx, u));
-    return Promise.all(tasks);
-  }
-
-  /* =====================================================================
-     MODULE: IP / DNS
-     ===================================================================== */
-  async function geoLookup(ctx, ip) {
-    const token = ctx.keys.ipinfo;
-    try {
-      const d = await ctx.json(`https://ipinfo.io/${enc(ip)}/json${token ? `?token=${enc(token)}` : ''}`, { timeout: 9000 });
-      if (d.bogon) return { bogon: true };
-      const m = /^(AS\d+)\s+(.*)$/.exec(d.org || '');
-      return {
-        source: 'ipinfo.io', ip: d.ip, hostname: d.hostname, city: d.city, region: d.region, countryCode: d.country,
-        postal: d.postal, loc: d.loc, timezone: d.timezone, asn: m ? m[1] : '', org: m ? m[2] : d.org, anycast: d.anycast,
-      };
-    } catch (err) {
-      if (ctx.signal.aborted) throw err;
-      const d = await ctx.json(`https://ipwho.is/${enc(ip)}`, { timeout: 9000 });
-      if (!d.success) { const e = new Error(d.message || 'Lookup failed'); throw e; }
-      return {
-        source: 'ipwho.is (fallback)', ip: d.ip, city: d.city, region: d.region, countryCode: d.country_code,
-        postal: d.postal, loc: d.latitude != null ? `${d.latitude},${d.longitude}` : '', timezone: d.timezone && d.timezone.id,
-        asn: d.connection && d.connection.asn ? `AS${d.connection.asn}` : '', org: d.connection && (d.connection.org || d.connection.isp),
-        type: d.type, continent: d.continent,
-      };
-    }
-  }
-
-  function renderGeo(g, origin) {
-    const [lat, lon] = (g.loc || '').split(',');
-    const place = [g.city, g.region].filter(Boolean).join(', ');
-    return [
-      kv([
-        ['Resolved from', origin],
-        ['IP address', g.ip],
-        ['Location', place],
-        ['Country', g.countryCode ? `${flagEmoji(g.countryCode)} ${countryName(g.countryCode)} (${g.countryCode})` : ''],
-        ['Continent', g.continent],
-        ['Postal code', g.postal],
-        ['Coordinates', lat && lon ? `${lat}, ${lon}` : ''],
-        ['Time zone', g.timezone],
-        ['ASN', g.asn],
-        ['Organization', g.org],
-        ['Hostname', g.hostname],
-        ['Anycast', g.anycast ? 'Yes' : ''],
-        ['Address type', g.type],
-        ['Source', g.source],
-      ]),
-      lat && lon ? h('div', { class: 'chips' }, extLink('View on OpenStreetMap', `https://www.openstreetmap.org/?mlat=${enc(lat)}&mlon=${enc(lon)}#map=10/${enc(lat)}/${enc(lon)}`)) : null,
-      mutedP('IP geolocation is approximate and usually reflects the provider, not an exact address.'),
-    ];
-  }
-
-  function ipLinks(ip) {
-    return [
-      ['Shodan', `https://www.shodan.io/host/${enc(ip)}`],
-      ['Censys', `https://search.censys.io/hosts/${enc(ip)}`],
-      ['GreyNoise', `https://viz.greynoise.io/ip/${enc(ip)}`],
-      ['AbuseIPDB', `https://www.abuseipdb.com/check/${enc(ip)}`],
-      ['VirusTotal', `https://www.virustotal.com/gui/ip-address/${enc(ip)}`],
-      ['URLScan', `https://urlscan.io/ip/${enc(ip)}`],
-      ['BGP.he.net', `https://bgp.he.net/ip/${enc(ip)}`],
-      ['Cisco Talos', `https://talosintelligence.com/reputation_center/lookup?search=${enc(ip)}`],
-      ['IPinfo', `https://ipinfo.io/${enc(ip)}`],
-      ['Google dork', googleUrl(`"${ip}"`)],
-    ];
-  }
-
-  function runIp(ctx, q) {
-    const tasks = [];
-    const isHost = q.kind === 'host';
-    let ipPromise;
-
-    if (isHost) {
-      ipPromise = (async () => {
-        const a = await ctx.dns(q.value, 'A');
-        if (a.answers.length) return a.answers[0].data;
-        const aaaa = await ctx.dns(q.value, 'AAAA');
-        return aaaa.answers.length ? aaaa.answers[0].data : null;
-      })();
-      ipPromise.catch(() => {});
-      tasks.push(ctx.task(`DNS records for ${q.value}`, async (card) => {
-        const types = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT'];
-        const results = await Promise.all(types.map((t) => ctx.dns(q.value, t).catch(() => ({ answers: [] }))));
-        const map = Object.fromEntries(types.map((t, i) => [t, results[i].answers]));
-        if (results[0].status === 3) { card.empty('NXDOMAIN: this hostname does not exist.', 'Not found'); return; }
-        const count = Object.values(map).reduce((s, l) => s + l.length, 0);
-        if (!count) { card.empty('No DNS records returned.'); return; }
-        card.ok([recordsView(map), mutedP('The first resolved IP address is analyzed below. Run other addresses separately.')], `${count} records`);
-      }));
-    } else {
-      ipPromise = Promise.resolve(q.value);
-    }
-
-    tasks.push(ctx.task('Geolocation & network', async (card) => {
-      const ip = await ipPromise;
-      if (!ip) { card.empty('The hostname did not resolve to an IP address.'); return; }
-      if (isPrivateIp(ip)) {
-        card.note([p(`${ip} is a private or reserved address. It is not routable on the public internet, so no geolocation or ownership data exists.`)], 'Private');
-        return;
-      }
-      const g = await geoLookup(ctx, ip);
-      if (g.bogon) { card.note([p(`${ip} is a reserved (bogon) address with no public data.`)], 'Reserved'); return; }
-      card.ok(renderGeo(g, isHost ? q.value : ''), 'Located');
-    }));
-
-    tasks.push(ctx.task('Reverse DNS (PTR)', async (card) => {
-      const ip = await ipPromise;
-      if (!ip) { card.empty('No IP address to look up.'); return; }
-      const r = await ctx.dns(reverseName(ip), 'PTR');
-      if (!r.answers.length) { card.empty(`No PTR record is published for ${ip}.`); return; }
-      card.ok([chips(r.answers.map((a) => a.data), true)], `${r.answers.length} found`);
-    }));
-
-    tasks.push(ctx.task('Open ports & exposure (Shodan InternetDB)', async (card) => {
-      const ip = await ipPromise;
-      if (!ip) { card.empty('No IP address to look up.'); return; }
-      if (isPrivateIp(ip)) { card.empty('Private addresses are not indexed.'); return; }
-      let d;
-      try {
-        d = await ctx.json(`https://internetdb.shodan.io/${enc(ip)}`, { timeout: 10000 });
-      } catch (err) {
-        if (err.status === 404) { card.empty('Shodan InternetDB has no information about this address.'); return; }
-        throw err;
-      }
-      const sections = [];
-      if (d.ports && d.ports.length) sections.push(['Open ports', chips(d.ports.map(String), true)]);
-      if (d.hostnames && d.hostnames.length) sections.push(['Hostnames', chips(d.hostnames, true)]);
-      if (d.tags && d.tags.length) sections.push(['Tags', chips(d.tags)]);
-      if (d.cpes && d.cpes.length) sections.push(['Software (CPE)', chips(d.cpes, true)]);
-      if (d.vulns && d.vulns.length) {
-        sections.push(['Known vulnerabilities', linkChips(d.vulns.slice(0, 60).map((v) => [v, `https://nvd.nist.gov/vuln/detail/${enc(v)}`]))]);
-      }
-      if (!sections.length) { card.empty('The address is indexed but exposes nothing notable.'); return; }
-      card.ok([kv(sections)], d.vulns && d.vulns.length ? `${d.vulns.length} CVEs` : 'Indexed');
-    }));
-
-    tasks.push(ctx.task('Threat intel & lookup links', async (card) => {
-      const ip = await ipPromise;
-      if (!ip) { card.empty('No IP address to look up.'); return; }
-      card.ok([linkChips(ipLinks(ip))], 'Links');
-    }));
-
-    tasks.push(intelxTask(ctx, q.value));
-    return Promise.all(tasks);
-  }
-
-  /* =====================================================================
-     MODULE: Domain
-     ===================================================================== */
-  function parseRdap(d) {
-    const ev = (a) => ((d.events || []).find((e) => e.eventAction === a) || {}).eventDate;
-    const registrarEnt = (d.entities || []).find((e) => (e.roles || []).includes('registrar'));
-    let registrar = '';
-    if (registrarEnt && registrarEnt.vcardArray && Array.isArray(registrarEnt.vcardArray[1])) {
-      const fn = registrarEnt.vcardArray[1].find((x) => x[0] === 'fn');
-      registrar = fn ? fn[3] : '';
-    }
-    return {
-      registrar,
-      created: ev('registration'),
-      updated: ev('last changed'),
-      expires: ev('expiration'),
-      status: d.status || [],
-      ns: (d.nameservers || []).map((n) => (n.ldhName || '').toLowerCase()).filter(Boolean),
-      dnssec: d.secureDNS ? (d.secureDNS.delegationSigned ? 'Signed' : 'Unsigned') : '',
-    };
-  }
-
-  function ageOf(iso) {
-    const t = new Date(iso).getTime();
-    if (Number.isNaN(t)) return '';
-    const days = Math.floor((Date.now() - t) / 86400000);
-    if (days < 0) return '';
-    const y = Math.floor(days / 365);
-    return y >= 1 ? `${y} yr${y > 1 ? 's' : ''} ago` : `${days} day${days === 1 ? '' : 's'} ago`;
-  }
-
-  async function findSubdomains(ctx, domain) {
-    let names;
-    let source;
-    try {
-      const rows = await ctx.json(`https://crt.sh/?q=${enc(`%.${domain}`)}&output=json`, { timeout: 22000 });
-      names = rows.flatMap((r) => String(r.name_value || '').split('\n'));
-      source = 'crt.sh';
-    } catch (err) {
-      if (ctx.signal.aborted) throw err;
-      const rows = await ctx.json(`https://api.certspotter.com/v1/issuances?domain=${enc(domain)}&include_subdomains=true&expand=dns_names`, { timeout: 22000 });
-      names = rows.flatMap((r) => r.dns_names || []);
-      source = 'Certificate Transparency (SSLMate)';
-    }
-    const set = new Set(names.map((n) => n.trim().toLowerCase().replace(/^\*\./, ''))
-      .filter((n) => n === domain || n.endsWith(`.${domain}`)));
-    return { list: [...set].sort(), source };
-  }
-
-  function domainLinks(d) {
-    return [
-      ['VirusTotal', `https://www.virustotal.com/gui/domain/${enc(d)}`],
-      ['URLScan', `https://urlscan.io/search/#domain:${enc(d)}`],
-      ['SecurityTrails', `https://securitytrails.com/domain/${enc(d)}/dns`],
-      ['Shodan', `https://www.shodan.io/search?query=hostname:${enc(d)}`],
-      ['crt.sh', `https://crt.sh/?q=${enc(d)}`],
-      ['BuiltWith', `https://builtwith.com/${enc(d)}`],
-      ['Wayback Machine', `https://web.archive.org/web/*/${enc(d)}`],
-      ['DNSDumpster', 'https://dnsdumpster.com/'],
-      ['MXToolbox', `https://mxtoolbox.com/SuperTool.aspx?action=mx%3a${enc(d)}`],
-      ['Who.is', `https://who.is/whois/${enc(d)}`],
-    ];
-  }
-
-  function domainDorks(d) {
-    return [
-      `site:${d}`,
-      `site:${d} -www`,
-      `site:*.${d} -www`,
-      `site:${d} (inurl:admin OR inurl:login OR inurl:dashboard)`,
-      `site:${d} (ext:pdf OR ext:doc OR ext:docx OR ext:xls OR ext:xlsx)`,
-      `site:${d} (ext:env OR ext:log OR ext:bak OR ext:sql)`,
-      `site:${d} intitle:"index of"`,
-      `"@${d}" -site:${d}`,
-      `"${d}" site:pastebin.com OR site:github.com`,
-      `link:${d} -site:${d}`,
-    ];
-  }
-
-  function runDomain(ctx, domain) {
-    const tasks = [];
-
-    tasks.push(ctx.task('DNS records', async (card) => {
-      const types = ['A', 'AAAA', 'NS', 'MX', 'TXT', 'CAA', 'SOA'];
-      const results = await Promise.all(types.map((t) => ctx.dns(domain, t).catch(() => null)));
-      if (results.every((r) => !r)) throw Object.assign(new Error('network'), { network: true });
-      if (results[0] && results[0].status === 3) { card.empty('NXDOMAIN: this domain does not exist in DNS.', 'Not found'); return; }
-      const map = Object.fromEntries(types.map((t, i) => [t, results[i] ? results[i].answers : []]));
-      const count = Object.values(map).reduce((s, l) => s + l.length, 0);
-      if (!count) { card.empty('No DNS records returned.'); return; }
-      card.ok([recordsView(map)], `${count} records`);
-    }));
-
-    tasks.push(ctx.task('Registration (RDAP / WHOIS)', async (card) => {
-      let d;
-      try {
-        d = await ctx.json(`https://rdap.org/domain/${enc(domain)}`, { timeout: 15000, headers: { accept: 'application/rdap+json, application/json' } });
-      } catch (err) {
-        if (err.status === 404) {
-          card.empty('No RDAP record found. If this is a subdomain, query the registrable domain (e.g. example.com). Some TLDs do not publish RDAP.');
-          return;
+    const done = panel(out, 'Live account check', async () => {
+      const wrap = h('div', {}, summary, table(['Platform', 'Status', 'Details', 'Link'], []));
+      const tbody = wrap.querySelector('tbody');
+      rows.forEach(r => tbody.append(r.tr));
+      let found = 0, checked = 0;
+      await Promise.all(rows.map(async r => {
+        const { c } = r;
+        if (c.valid && !c.valid(u)) { r.st.replaceChildren(badge('unk', 'Invalid name')); r.info.textContent = 'Username format not allowed here'; return; }
+        try {
+          const { status, data } = await fetchStatus(c.api(name), { timeout: 9000 });
+          const res = c.ok(status, data);
+          checked++;
+          if (!res) r.st.replaceChildren(badge('unk', status === 429 || status === 403 ? 'Rate limited' : 'Unknown'));
+          else if (res.f) { found++; r.st.replaceChildren(badge('found', 'Found')); r.info.textContent = res.i || ''; }
+          else r.st.replaceChildren(badge('miss', 'Not found'));
+        } catch (e) {
+          r.st.replaceChildren(badge('unk', 'Unreachable'));
+          r.info.textContent = 'Blocked or offline';
         }
-        throw err;
-      }
-      const r = parseRdap(d);
-      card.ok([
-        kv([
-          ['Registrar', r.registrar],
-          ['Created', r.created ? `${fmtDate(r.created)} (${ageOf(r.created)})` : ''],
-          ['Last changed', r.updated ? fmtDate(r.updated) : ''],
-          ['Expires', r.expires ? fmtDate(r.expires) : ''],
-          ['Status', r.status.length ? chips(r.status) : ''],
-          ['Name servers', r.ns.length ? chips(r.ns, true) : ''],
-          ['DNSSEC', r.dnssec],
-        ]),
-        mutedP('Contact details are usually redacted for privacy (GDPR).'),
-      ], 'Registered');
-    }));
+        summary.textContent = `${found} profile${found === 1 ? '' : 's'} found · ${checked}/${rows.length} checked`;
+      }));
+      summary.textContent = `${found} profile${found === 1 ? '' : 's'} found across ${checked} platforms that allow browser lookups.`;
+      return wrap;
+    }, 'Public APIs', true);
 
-    tasks.push(ctx.task('Subdomains (certificate transparency)', async (card) => {
-      const { list, source } = await findSubdomains(ctx, domain);
-      if (!list.length) { card.empty('No certificates were found for this domain.'); return; }
-      const copy = h('button', { class: 'link', type: 'button' }, 'Copy all');
-      copy.addEventListener('click', async () => {
-        const ok = await copyText(list.join('\n'));
-        copy.textContent = ok ? 'Copied' : 'Copy failed';
-        setTimeout(() => { copy.textContent = 'Copy all'; }, 1500);
-      });
-      card.ok([
-        p(`${num(list.length)} unique hostnames seen in public certificates (${source}).`),
-        h('div', { class: 'chips scroll-list' }, list.slice(0, 400).map((s) => h('span', { class: 'chip mono' }, s))),
-        list.length > 400 ? mutedP(`Showing the first 400 of ${num(list.length)}. Use "Copy all" for the full list.`) : null,
-        h('div', { class: 'chips' }, copy),
-      ], `${num(list.length)} found`);
-    }));
+    panel(out, 'Manual verification links', () => [
+      note('Most large networks block automated checks from browsers, so open these to confirm by eye. Treat identical usernames as leads, not proof of identity.'),
+      linkGrid(MANUAL_PROFILES.map(([t, f]) => ({ t, u: f(name), d: hostOf(f(name)) })))
+    ], `${MANUAL_PROFILES.length} sites`, true);
 
-    tasks.push(ctx.task('Email security (SPF & DMARC)', async (card) => {
-      const [txt, dmarc] = await Promise.all([ctx.dns(domain, 'TXT'), ctx.dns(`_dmarc.${domain}`, 'TXT')]);
-      const spf = txt.answers.find((a) => /^v=spf1/i.test(a.data));
-      const dm = dmarc.answers.find((a) => /^v=DMARC1/i.test(a.data));
-      const policy = dm && /(?:^|;)\s*p=(\w+)/i.exec(dm.data);
-      card.ok([kv([
-        ['SPF', spf ? h('code', null, spf.data) : 'Not published'],
-        ['DMARC', dm ? h('code', null, dm.data) : 'Not published'],
-        ['DMARC policy', policy ? policy[1].toLowerCase() : ''],
-      ]), mutedP('A missing or "none" policy can mean the domain is easier to spoof in email.')], 'Checked');
-    }));
-
-    tasks.push(ctx.task('Web archive history', async (card) => {
-      const d = await ctx.json(`https://archive.org/wayback/available?url=${enc(domain)}`, { timeout: 12000 });
-      const snap = d && d.archived_snapshots && d.archived_snapshots.closest;
-      if (!snap || !snap.available) { card.empty('The Wayback Machine has no snapshots of this domain.'); return; }
-      const ts = snap.timestamp || '';
-      const iso = /^\d{14}$/.test(ts) ? `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}T${ts.slice(8, 10)}:${ts.slice(10, 12)}:${ts.slice(12, 14)}Z` : '';
-      card.ok([
-        kv([['Closest snapshot', iso ? fmtDate(iso) : ts]]),
-        h('div', { class: 'chips' },
-          extLink('Open snapshot', String(snap.url).replace(/^http:/, 'https:')),
-          extLink('Full timeline', `https://web.archive.org/web/*/${enc(domain)}`)),
-      ], 'Archived');
-    }));
-
-    tasks.push(ctx.task('Google dorks', async (card) => {
-      card.ok([mutedP('Queries to map exposed pages, documents and mentions of this domain.'), dorksList(domainDorks(domain))], 'Ready');
-    }));
-
-    tasks.push(ctx.task('Investigation links', async (card) => { card.ok([linkChips(domainLinks(domain))], 'Links'); }));
-    tasks.push(intelxTask(ctx, domain));
-    return Promise.all(tasks);
+    panel(out, 'Search engine & leak-index pivots', () => linkGrid([
+      { t: 'Google — exact', u: gsearch(`"${u}"`), d: 'Exact username mentions' },
+      { t: 'Google — profiles', u: gsearch(`"${u}" (inurl:user OR inurl:profile OR inurl:u OR inurl:@${u})`), d: 'Profile-style URLs' },
+      { t: 'Google — code & pastes', u: gsearch(`"${u}" (site:github.com OR site:gist.github.com OR site:pastebin.com OR site:gitlab.com)`), d: 'Public code and paste sites' },
+      { t: 'Bing', u: `https://www.bing.com/search?q=${enc(`"${u}"`)}`, d: 'Second index' },
+      { t: 'DuckDuckGo', u: `https://duckduckgo.com/?q=${enc(`"${u}"`)}`, d: 'Privacy-friendly index' },
+      { t: 'Yandex', u: `https://yandex.com/search/?text=${enc(`"${u}"`)}`, d: 'Strong on Eastern-European sites' },
+      { t: 'Intelligence X', u: `https://intelx.io/?s=${name}`, d: 'Free tier searches leaks & pastes' },
+      { t: 'Wayback Machine', u: `https://web.archive.org/web/*/${name}*`, d: 'Archived pages mentioning it' },
+      { t: 'Reverse username (WhatsMyName)', u: 'https://whatsmyname.app/', d: 'Open-source username checker' }
+    ]), 'Pivots', true);
+    await done;
   }
 
   /* =====================================================================
-     MODULE: Phone
+     Tool: IP / DNS Analysis
      ===================================================================== */
-  let phoneLibPromise = null;
-  function loadPhoneLib() {
-    if (window.libphonenumber) return Promise.resolve(window.libphonenumber);
-    if (!phoneLibPromise) {
-      phoneLibPromise = new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/libphonenumber-js@1.11.4/bundle/libphonenumber-max.js';
-        s.async = true;
-        s.onload = () => (window.libphonenumber ? resolve(window.libphonenumber) : reject(new Error('Parser loaded without exports.')));
-        s.onerror = () => { phoneLibPromise = null; s.remove(); reject(new Error('The phone-number parser could not be loaded.')); };
-        document.head.append(s);
-      });
+  async function ipInfoPanel(ip) {
+    const tok = store.get('osintnow.ipinfo');
+    let data, srcName = 'ipinfo.io';
+    try {
+      data = await fetchJSON(`https://ipinfo.io/${enc(ip)}/json${tok ? `?token=${enc(tok)}` : ''}`, { timeout: 9000 });
+      if (data.bogon) return note('This is a bogon / reserved address (private, loopback or otherwise non-routable), so no public geolocation exists.');
+      const [asn, ...orgParts] = (data.org || '').split(' ');
+      const loc = (data.loc || '').split(',');
+      return [kv([
+        ['IP address', data.ip, true], ['Hostname', data.hostname, true],
+        ['Country', data.country ? `${flag(data.country)} ${regionName(data.country)} (${data.country})` : ''],
+        ['Region / city', [data.city, data.region, data.postal].filter(Boolean).join(', ')],
+        ['Coordinates', data.loc ? ext(`https://www.openstreetmap.org/?mlat=${loc[0]}&mlon=${loc[1]}#map=10/${loc[0]}/${loc[1]}`, `${data.loc} (open map)`) : ''],
+        ['ASN', /^AS\d+/i.test(asn || '') ? asn : '', true], ['Organization', /^AS\d+/i.test(asn || '') ? orgParts.join(' ') : data.org],
+        ['Timezone', data.timezone]
+      ]), src(`Source: ${srcName}. IP geolocation is approximate — often city-level at best, and VPN/proxy exits show the provider's location.`)];
+    } catch (e1) {
+      try {
+        srcName = 'ipwho.is';
+        data = await fetchJSON(`https://ipwho.is/${enc(ip)}`, { timeout: 9000 });
+        if (data.success === false) throw new Error(data.message || 'Lookup failed.');
+        return [kv([
+          ['IP address', data.ip, true], ['Type', data.type],
+          ['Country', data.country_code ? `${flag(data.country_code)} ${data.country} (${data.country_code})` : data.country],
+          ['Region / city', [data.city, data.region, data.postal].filter(Boolean).join(', ')],
+          ['Coordinates', data.latitude != null ? ext(`https://www.openstreetmap.org/?mlat=${data.latitude}&mlon=${data.longitude}#map=10/${data.latitude}/${data.longitude}`, `${data.latitude}, ${data.longitude} (open map)`) : ''],
+          ['ASN', J(data, 'connection', 'asn') ? `AS${data.connection.asn}` : '', true], ['Organization', J(data, 'connection', 'org')], ['ISP', J(data, 'connection', 'isp')],
+          ['Domain', J(data, 'connection', 'domain'), true], ['Timezone', J(data, 'timezone', 'id')]
+        ]), src('Source: ipwho.is (fallback — ipinfo.io was unavailable). Geolocation is approximate.')];
+      } catch (e2) { throw e1; }
     }
-    return phoneLibPromise;
   }
 
+  async function runIPDNS(input, out) {
+    const raw = input.trim();
+    let host = null, ip = null;
+    if (isIPv4(raw) || isIPv6(raw)) ip = raw;
+    else { host = normDomain(raw); if (!host) throw new Error('Enter a valid IPv4, IPv6 address, hostname or domain.'); }
+
+    if (host) {
+      const ipsP = (async () => {
+        const r = await Promise.allSettled([doh(host, 'A'), doh(host, 'AAAA')]);
+        return r.flatMap(x => x.status === 'fulfilled' ? x.value.answers.filter(a => a.type === 'A' || a.type === 'AAAA').map(a => a.data) : []);
+      })();
+      panel(out, `DNS records · ${host}`, () => dnsTable(host, ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA']), 'DoH', true);
+      const ips = [...new Set(await ipsP)];
+      if (!ips.length) { panel(out, 'Resolution', () => 'This hostname has no A/AAAA records, so there is no IP address to analyze.'); return; }
+      ip = ips[0];
+      if (ips.length > 1) panel(out, 'Resolved addresses', () => [chips(ips, true), note(`Showing network details for the first address (${ip}). Paste another to inspect it.`)], `${ips.length} IPs`);
+    }
+
+    panel(out, 'Geolocation & network', () => ipInfoPanel(ip), ip);
+    panel(out, 'Reverse DNS (PTR)', async () => {
+      const r = await doh(reverseName(ip), 'PTR');
+      const ptr = r.answers.filter(a => a.type === 'PTR').map(a => a.data);
+      return ptr.length ? [chips(ptr, true), src('PTR records often reveal hosting providers, ISPs or mail servers.')] : 'No PTR record is published for this address.';
+    });
+    panel(out, 'Pivot to other sources', () => linkGrid([
+      { t: 'Shodan', u: `https://www.shodan.io/host/${enc(ip)}`, d: 'Open ports & banners' },
+      { t: 'Censys', u: `https://search.censys.io/hosts/${enc(ip)}`, d: 'Services & certificates' },
+      { t: 'AbuseIPDB', u: `https://www.abuseipdb.com/check/${enc(ip)}`, d: 'Abuse reports' },
+      { t: 'GreyNoise', u: `https://viz.greynoise.io/ip/${enc(ip)}`, d: 'Internet scanner noise' },
+      { t: 'VirusTotal', u: `https://www.virustotal.com/gui/ip-address/${enc(ip)}`, d: 'Reputation & relations' },
+      { t: 'Hurricane Electric BGP', u: `https://bgp.he.net/ip/${enc(ip)}`, d: 'Routing & prefixes' },
+      { t: 'Intelligence X', u: `https://intelx.io/?s=${enc(ip)}`, d: 'Leaks & pastes' },
+      { t: 'urlscan.io', u: `https://urlscan.io/search/#${enc(`ip:"${ip}"`)}`, d: 'Scans hosted on this IP' }
+    ]), 'Pivots', true);
+  }
+
+  /* =====================================================================
+     Tool: Domain Analysis
+     ===================================================================== */
+  const TXT_SERVICES = [
+    [/^google-site-verification=/i, 'Google Search Console / Workspace'], [/^MS=/i, 'Microsoft 365'], [/^facebook-domain-verification=/i, 'Meta / Facebook'],
+    [/^atlassian-domain-verification=/i, 'Atlassian'], [/^docusign=/i, 'DocuSign'], [/^stripe-verification=/i, 'Stripe'], [/^apple-domain-verification=/i, 'Apple'],
+    [/^zoom-domain-verification/i, 'Zoom'], [/^adobe-idp-site-verification=/i, 'Adobe'], [/^github-challenge-/i, 'GitHub'], [/^openai-domain-verification=/i, 'OpenAI'],
+    [/^slack-domain-verification=/i, 'Slack'], [/^h1-domain-verification=/i, 'HackerOne'], [/^_?globalsign-domain-verification=/i, 'GlobalSign'],
+    [/^amazonses:/i, 'Amazon SES'], [/^dropbox-domain-verification=/i, 'Dropbox'], [/^miro-verification=/i, 'Miro'], [/^onetrust-domain-verification=/i, 'OneTrust'],
+    [/^mailchimp/i, 'Mailchimp'], [/^shopify-verification/i, 'Shopify']
+  ];
+
+  function rdapPanel(d) {
+    const ev = {};
+    (d.events || []).forEach(e => { ev[e.eventAction] = e.eventDate; });
+    const reg = (d.entities || []).find(e => (e.roles || []).includes('registrar'));
+    const fn = e => { const a = J(e, 'vcardArray', 1) && e.vcardArray[1].find(x => x[0] === 'fn'); return a ? a[3] : ''; };
+    const age = ev.registration ? daysSince(ev.registration) : null;
+    const expIn = ev.expiration ? Math.ceil((new Date(ev.expiration) - Date.now()) / 864e5) : null;
+    return [kv([
+      ['Domain', d.ldhName, true],
+      ['Status', d.status && d.status.length ? d.status : ''],
+      ['Registered', ev.registration ? `${fmtDate(ev.registration)}${age != null ? ` (${(age / 365.25).toFixed(1)} years ago)` : ''}` : ''],
+      ['Last changed', ev['last changed'] ? fmtDate(ev['last changed']) : ''],
+      ['Expires', ev.expiration ? `${fmtDate(ev.expiration)}${expIn != null ? ` (${expIn >= 0 ? `in ${expIn} days` : `${-expIn} days ago`})` : ''}` : ''],
+      ['Registrar', fn(reg) || J(reg, 'publicIds', 0, 'identifier')],
+      ['Name servers', (d.nameservers || []).map(n => (n.ldhName || '').toLowerCase()).filter(Boolean), true],
+      ['DNSSEC', d.secureDNS ? (d.secureDNS.delegationSigned ? 'Signed' : 'Unsigned') : '']
+    ]), src('Source: RDAP via rdap.org. Contact details are usually redacted for privacy (GDPR).')];
+  }
+
+  async function mailSecurity(d) {
+    const [txt, dm, mx] = await Promise.allSettled([doh(d, 'TXT'), doh(`_dmarc.${d}`, 'TXT'), doh(d, 'MX')]);
+    if (txt.status === 'rejected' && mx.status === 'rejected') throw new Error('DNS-over-HTTPS resolvers could not be reached.');
+    const txts = x => x.status === 'fulfilled' ? x.value.answers.filter(a => a.type === 'TXT').map(a => a.data) : [];
+    const all = txts(txt);
+    const spf = all.filter(x => /^v=spf1/i.test(x));
+    const dmarc = txts(dm).filter(x => /^v=DMARC1/i.test(x));
+    const mxs = mx.status === 'fulfilled' ? mx.value.answers.filter(a => a.type === 'MX').map(a => a.data) : [];
+    const services = [...new Set(all.flatMap(t => TXT_SERVICES.filter(([re]) => re.test(t)).map(([, n]) => n)))];
+    return [kv([
+      ['Mail servers (MX)', mxs, true],
+      ['SPF', spf.length ? spf : 'Not published', true],
+      ['DMARC', dmarc.length ? dmarc : 'Not published', true],
+      ['Third-party services', services.length ? services.join(', ') : '']
+    ]), src('Verification TXT records reveal which SaaS platforms the organization has registered with.')];
+  }
+
+  async function subdomainPanel(d) {
+    const data = await fetchJSON(`https://api.certspotter.com/v1/issuances?domain=${enc(d)}&include_subdomains=true&expand=dns_names`, { timeout: 15000 });
+    const set = new Set();
+    (Array.isArray(data) ? data : []).forEach(c => (c.dns_names || []).forEach(n => {
+      const x = n.replace(/^\*\./, '').toLowerCase();
+      if (x === d || x.endsWith(`.${d}`)) set.add(x);
+    }));
+    const list = [...set].sort();
+    if (!list.length) return 'No subdomains were found in public Certificate Transparency logs.';
+    return [h('div', { class: 'stat' }, h('b', { text: String(list.length) }), h('span', { text: 'unique names in certificates' })),
+      chips(list.slice(0, 120), true),
+      list.length > 120 ? note(`Showing 120 of ${list.length}.`) : null,
+      src('Source: Certificate Transparency via SSLMate Cert Spotter (free tier). Names may include historical or internal hosts.')];
+  }
+
+  async function urlscanPanel(d) {
+    const data = await fetchJSON(`https://urlscan.io/api/v1/search/?q=${enc(`domain:${d}`)}&size=10`, { timeout: 12000 });
+    const res = data.results || [];
+    if (!res.length) return 'No public urlscan.io scans found for this domain.';
+    return [table(['Date', 'Page', 'IP', 'Result'], res.map(r => [fmtDate(J(r, 'task', 'time')), String(J(r, 'page', 'url') || '').slice(0, 70), J(r, 'page', 'ip') || '', ext(`https://urlscan.io/result/${enc(r._id)}/`, 'View')])),
+      src(`Source: urlscan.io (${data.total ?? res.length} public scans total)`)];
+  }
+
+  async function waybackPanel(d) {
+    const data = await fetchJSON(`https://archive.org/wayback/available?url=${enc(d)}`, { timeout: 10000 });
+    const c = J(data, 'archived_snapshots', 'closest');
+    if (!c) return [note('No snapshots found in the Wayback Machine.'), linkGrid([{ t: 'Wayback calendar', u: `https://web.archive.org/web/*/${enc(d)}`, d: 'archive.org' }])];
+    const ts = c.timestamp || '';
+    return [kv([['Closest snapshot', ext(c.url.replace(/^http:/, 'https:'), `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}`)], ['Status', c.status]]),
+      linkGrid([{ t: 'Full snapshot calendar', u: `https://web.archive.org/web/*/${enc(d)}`, d: 'archive.org' }])];
+  }
+
+  async function runDomain(input, out) {
+    const d = normDomain(input);
+    if (!d) throw new Error('Enter a valid domain such as example.com (URLs are fine — the host is extracted).');
+    panel(out, 'Registration (RDAP / WHOIS)', async () => {
+      const r = await fetchStatus(`https://rdap.org/domain/${enc(d)}`, { timeout: 15000 });
+      if (r.status === 404) return 'No RDAP record found. The domain may be unregistered, or its TLD does not publish RDAP.';
+      if (r.status !== 200 || !r.data) throw new Error(`The RDAP service answered with HTTP ${r.status}.`);
+      return rdapPanel(r.data);
+    }, d);
+    panel(out, 'DNS records', () => dnsTable(d, ['A', 'AAAA', 'NS', 'MX', 'TXT', 'CAA', 'SOA']), 'DoH', true);
+    panel(out, 'Email security & service footprint', () => mailSecurity(d));
+    panel(out, 'Subdomains (Certificate Transparency)', () => subdomainPanel(d));
+    panel(out, 'Recent public scans', () => urlscanPanel(d));
+    panel(out, 'Web archive', () => waybackPanel(d));
+    panel(out, 'Pivot to other sources', () => linkGrid([
+      { t: 'crt.sh', u: `https://crt.sh/?q=${enc(d)}`, d: 'Certificate search' },
+      { t: 'VirusTotal', u: `https://www.virustotal.com/gui/domain/${enc(d)}`, d: 'Reputation & relations' },
+      { t: 'SecurityTrails', u: `https://securitytrails.com/domain/${enc(d)}/dns`, d: 'DNS history' },
+      { t: 'Intelligence X', u: `https://intelx.io/?s=${enc(d)}`, d: 'Leaks, pastes, documents' },
+      { t: 'urlscan.io', u: `https://urlscan.io/search/#${enc(`domain:${d}`)}`, d: 'Scan history' },
+      { t: 'Shodan', u: `https://www.shodan.io/search?query=hostname%3A${enc(d)}`, d: 'Exposed services' },
+      { t: 'Google — site index', u: gsearch(`site:${d}`), d: 'Indexed pages' },
+      { t: 'Google — exposed files', u: gsearch(`site:${d} (ext:pdf OR ext:docx OR ext:xlsx OR ext:txt)`), d: 'Public documents' },
+      { t: 'BuiltWith', u: `https://builtwith.com/${enc(d)}`, d: 'Technology stack' }
+    ]), 'Pivots', true);
+  }
+
+  /* =====================================================================
+     Tool: Phone Number Analysis
+     ===================================================================== */
   const PHONE_TYPES = {
-    MOBILE: 'Mobile', FIXED_LINE: 'Landline', FIXED_LINE_OR_MOBILE: 'Landline or mobile', TOLL_FREE: 'Toll-free',
-    PREMIUM_RATE: 'Premium rate', SHARED_COST: 'Shared cost', VOIP: 'VoIP', PERSONAL_NUMBER: 'Personal number',
-    PAGER: 'Pager', UAN: 'Universal access number', VOICEMAIL: 'Voicemail',
+    MOBILE: 'Mobile', FIXED_LINE: 'Fixed line', FIXED_LINE_OR_MOBILE: 'Fixed line or mobile', TOLL_FREE: 'Toll-free', PREMIUM_RATE: 'Premium rate',
+    SHARED_COST: 'Shared cost', VOIP: 'VoIP', PERSONAL_NUMBER: 'Personal number', PAGER: 'Pager', UAN: 'Universal access number', VOICEMAIL: 'Voicemail'
   };
 
-  function phoneVariants(info) {
-    const out = [info.international, info.e164, info.national, info.nationalDigits].filter(Boolean);
-    return [...new Set(out)];
+  async function runPhone(input, out, ctx) {
+    const lib = window.libphonenumber;
+    if (!lib) throw new Error('The phone parsing library could not be loaded. Check your connection and reload the page.');
+    let p;
+    try { p = lib.parsePhoneNumberFromString(input.trim(), ctx.extra || undefined); } catch { /* handled below */ }
+    if (!p) throw new Error('That does not look like a phone number. Use international format (e.g. +1 415 555 2671) or choose a default country.');
+
+    const digits = p.number.replace(/\D/g, '');
+    const type = p.getType && p.getType();
+    const possible = p.getPossibleCountries ? p.getPossibleCountries() : [];
+
+    panel(out, 'Number intelligence', () => [kv([
+      ['Valid number', p.isValid() ? '✓ Matches a known numbering plan' : '✗ Not valid for any known numbering plan'],
+      ['Possible length', p.isPossible() ? '✓ Plausible length' : '✗ Length is not plausible'],
+      ['E.164', p.number, true], ['International', p.formatInternational(), true], ['National', p.formatNational(), true], ['RFC 3966', p.getURI(), true],
+      ['Country / region', p.country ? `${flag(p.country)} ${regionName(p.country)} (${p.country})` : ''],
+      ['Also possible', possible.length > 1 ? possible.map(c => `${flag(c)} ${regionName(c)}`).join(', ') : ''],
+      ['Calling code', `+${p.countryCallingCode}`, true], ['Line type', type ? (PHONE_TYPES[type] || type) : 'Not determinable from the number alone'],
+      ['National number', p.nationalNumber, true]
+    ]), src('Source: libphonenumber-js (Google numbering-plan metadata), computed offline in your browser. No number is sent to any server.'),
+    note('Carrier, owner and live status cannot be derived from the digits: numbers are ported between carriers and recycled.')], p.isValid() ? 'Valid' : 'Check format');
+
+    const variants = [...new Set([p.number, p.formatInternational(), p.formatNational(), digits, p.formatNational().replace(/[^\d]+/g, '-').replace(/^-|-$/g, ''), p.formatNational().replace(/[^\d]+/g, '.').replace(/^\.|\.$/g, '')])];
+    panel(out, 'Search variations', () => [
+      note('The same number is published in many formats. Searching all of them surfaces listings, ads, forum posts and scam reports.'),
+      chips(variants, true),
+      linkGrid([
+        { t: 'Google — all formats', u: gsearch(variants.map(v => `"${v}"`).join(' OR ')), d: 'Combined exact-match query' },
+        { t: 'Google — scam reports', u: gsearch(`(${variants.map(v => `"${v}"`).join(' OR ')}) (scam OR spam OR fraud OR "who called")`), d: 'Reputation' },
+        { t: 'Google — social & classifieds', u: gsearch(`(${variants.slice(0, 3).map(v => `"${v}"`).join(' OR ')}) (site:facebook.com OR site:linkedin.com OR site:olx.com OR site:craigslist.org OR site:x.com)`), d: 'Where numbers get posted' },
+        { t: 'Bing', u: `https://www.bing.com/search?q=${enc(variants.slice(0, 3).map(v => `"${v}"`).join(' OR '))}`, d: 'Second index' },
+        { t: 'Intelligence X', u: `https://intelx.io/?s=${enc(p.number)}`, d: 'Leaks & pastes' }
+      ])
+    ], `${variants.length} formats`, true);
+
+    panel(out, 'Pivot to caller-ID & messaging', () => [
+      note('These open third-party pages; nothing is sent until you click. Messaging apps may show a name or photo that the owner chose themselves.'),
+      linkGrid([
+        { t: 'WhatsApp', u: `https://wa.me/${digits}`, d: 'Check for an account' },
+        { t: 'Telegram', u: `https://t.me/+${digits}`, d: 'Check for an account' },
+        { t: 'Truecaller', u: `https://www.truecaller.com/search/${enc((p.country || 'us').toLowerCase())}/${p.nationalNumber}`, d: 'Crowd-sourced caller ID' },
+        { t: 'Sync.me', u: `https://sync.me/search/?number=${digits}`, d: 'Caller ID lookup' },
+        { t: 'Who Called Me (reports)', u: gsearch(`"${p.formatNational()}" who called`), d: 'Community reports' }
+      ])
+    ], 'Pivots', true);
   }
 
-  function runPhone(ctx, e164) {
-    const tasks = [];
-    const infoPromise = (async () => {
-      const digits = e164.slice(1);
-      try {
-        const lib = await loadPhoneLib();
-        const pn = lib.parsePhoneNumberFromString(e164);
-        if (!pn) return { e164, digits, partial: true, reason: 'The number could not be parsed.' };
-        let type = '';
-        try { type = pn.getType() || ''; } catch { type = ''; }
-        return {
-          e164: pn.number, digits: pn.number.slice(1), international: pn.formatInternational(), national: pn.formatNational(),
-          nationalDigits: String(pn.nationalNumber), country: pn.country, callingCode: pn.countryCallingCode,
-          valid: pn.isValid(), possible: pn.isPossible(), type,
-        };
-      } catch (err) {
-        return { e164, digits, partial: true, reason: err.message };
-      }
-    })();
+  const PHONE_LEARN = () => h('details', { class: 'learn-more', id: 'phone-learn' },
+    h('summary', { text: 'Learn more about phone number analysis' }),
+    h('div', { class: 'learn-body' },
+      h('div', {}, h('h4', { text: 'What a number reveals' }), h('ul', {},
+        h('li', { text: 'Country or region from the calling code (+1, +44, +39…).' }),
+        h('li', { text: 'Numbering-plan range: valid, plausible, or malformed.' }),
+        h('li', { text: 'Line type: mobile, fixed, VoIP, toll-free or premium.' }),
+        h('li', { text: 'Every standard notation (E.164, national, RFC 3966) for searching.' }))),
+      h('div', {}, h('h4', { text: 'What it does not reveal' }), h('ul', {},
+        h('li', { text: 'The owner’s identity or exact location.' }),
+        h('li', { text: 'The current carrier — number portability breaks old lookups.' }),
+        h('li', { text: 'Whether it is active: numbers are recycled and caller IDs are spoofed.' }))),
+      h('div', {}, h('h4', { text: 'Typical investigation workflow' }), h('ul', {},
+        h('li', { text: 'Normalize to E.164, then search every format variation.' }),
+        h('li', { text: 'Check community scam/spam reports and caller-ID reputation.' }),
+        h('li', { text: 'See whether messaging apps expose a self-chosen name or photo.' }),
+        h('li', { text: 'Look in public registries, classifieds, WHOIS/RDAP contacts and archives.' }),
+        h('li', { text: 'Corroborate with at least two independent sources before concluding.' }))),
+      h('div', {}, h('h4', { text: 'Good practice' }), h('ul', {},
+        h('li', { text: 'Only investigate numbers you are authorized to research (your own, your organization’s, or reported abuse).' }),
+        h('li', { text: 'Do not contact, harass or publish personal details of private individuals.' }),
+        h('li', { text: 'Respect privacy law (GDPR, CCPA) and each service’s terms.' })))));
 
-    tasks.push(ctx.task('Number details', async (card) => {
-      const i = await infoPromise;
-      if (i.partial) {
-        card.note([
-          p(i.reason),
-          kv([['E.164', i.e164], ['Digits', i.digits]]),
-          mutedP('Country, validity and line type need the parser library. Check your connection and run the analysis again.'),
-        ], 'Limited');
-        return;
-      }
-      card.ok([
-        kv([
-          ['E.164 format', h('code', null, i.e164)],
-          ['International', i.international],
-          ['National', i.national],
-          ['Country / region', i.country ? `${flagEmoji(i.country)} ${countryName(i.country)} (${i.country})` : 'Shared or unassigned region'],
-          ['Calling code', `+${i.callingCode}`],
-          ['Valid number', i.valid ? 'Yes' : 'No, this number does not match any known numbering plan'],
-          ['Possible length', i.possible ? 'Yes' : 'No'],
-          ['Line type', PHONE_TYPES[i.type] || (i.valid ? 'Unknown' : '')],
-        ]),
-        mutedP('Carrier and subscriber names are not available from free public APIs, and country data shows where the number range was issued, not where the phone is.'),
-      ], i.valid ? 'Valid' : 'Invalid');
-    }));
+  /* =====================================================================
+     Tool: Minecraft Account Analysis
+     ===================================================================== */
+  const dashUUID = r => r.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
 
-    tasks.push(ctx.task('Google dorks', async (card) => {
-      const i = await infoPromise;
-      const vs = phoneVariants(i);
-      const any = vs.map((v) => `"${v}"`).join(' OR ');
-      const main = vs[0] ? `"${vs[0]}"` : `"${e164}"`;
-      card.ok([
-        mutedP('Phone numbers appear in different formats, so these queries cover the common variants.'),
-        dorksList([
-          any,
-          `(${any}) (contact OR whatsapp OR telegram OR viber)`,
-          `(${any}) site:facebook.com OR site:linkedin.com OR site:instagram.com`,
-          `(${any}) site:pastebin.com OR site:github.com`,
-          `(${any}) (filetype:pdf OR filetype:doc OR filetype:xls)`,
-          `${main} (scam OR spam OR fraud OR "who called")`,
-        ]),
-      ], 'Ready');
-    }));
+  async function runMinecraft(input, out, ctx) {
+    const v = input.trim();
+    const isUUID = /^[0-9a-f]{8}-?([0-9a-f]{4}-?){3}[0-9a-f]{12}$/i.test(v);
+    if (!isUUID && !/^[A-Za-z0-9_]{3,16}$/.test(v)) throw new Error('Java usernames are 3–16 characters (letters, numbers, underscore). You can also paste a UUID.');
 
-    tasks.push(ctx.task('Lookup & messaging links', async (card) => {
-      const i = await infoPromise;
-      const links = [
-        ['WhatsApp', `https://wa.me/${i.digits}`],
-        ['Telegram', `https://t.me/+${i.digits}`],
-        ['Signal', `https://signal.me/#p/+${i.digits}`],
-        ['Sync.me', `https://sync.me/search/?number=${i.digits}`],
-      ];
-      if (i.country && i.nationalDigits) links.unshift(['Truecaller', `https://www.truecaller.com/search/${i.country.toLowerCase()}/${i.nationalDigits}`]);
-      card.ok([
-        linkChips(links),
-        mutedP('Messaging links show whether an account exists and may reveal a public profile name or photo. They do not notify the owner until you send a message.'),
-      ], 'Links');
-    }));
+    const { status, data } = await fetchStatus(`https://playerdb.co/api/player/minecraft/${enc(v)}`, { timeout: 12000 });
+    const player = status === 200 && data && data.success ? J(data, 'data', 'player') : null;
 
-    tasks.push(intelxTask(ctx, e164));
-    return Promise.all(tasks);
+    if (!player) {
+      panel(out, 'Mojang profile', () => status === 429 ? 'Rate limited by the lookup service. Try again shortly.' : [
+        note(`No Java Edition account found for “${v}”. It may be available, misspelled, or belong to a Bedrock-only account.`),
+        src('Source: Mojang session servers via PlayerDB')]);
+      panel(out, 'Check availability & history', () => linkGrid([
+        { t: 'NameMC', u: `https://namemc.com/search?q=${enc(v)}`, d: 'Availability & drop times' },
+        { t: 'LABY.net', u: `https://laby.net/@${enc(v)}`, d: 'Name history' }
+      ]), 'Pivots', true);
+      return;
+    }
+
+    const uuid = player.id || dashUUID(player.raw_id || '');
+    const raw = (player.raw_id || uuid.replace(/-/g, ''));
+    const history = player.name_history || J(player, 'meta', 'name_history') || [];
+    const skin = player.skin_texture ? String(player.skin_texture).replace(/^http:/, 'https:') : '';
+
+    panel(out, 'Mojang profile', () => [
+      h('div', { class: 'mc' },
+        h('img', { class: 'avatar', src: `https://crafatar.com/avatars/${enc(raw)}?size=96&overlay`, alt: `${player.username} avatar`, loading: 'lazy', width: 96, height: 96, onerror: e => e.target.remove() }),
+        h('img', { class: 'body-render', src: `https://crafatar.com/renders/body/${enc(raw)}?scale=4&overlay`, alt: `${player.username} skin render`, loading: 'lazy', onerror: e => e.target.remove() })),
+      kv([
+        ['Username', player.username, true], ['UUID', uuid, true], ['UUID (no dashes)', raw, true],
+        ['Skin texture', skin ? ext(skin, 'View texture file') : ''],
+        ['Name history', history.length ? history.map(x => `${x.name}${x.changedToAt ? ` — ${fmtDate(x.changedToAt)}` : ' — original'}`) : '']
+      ]),
+      src('Source: Mojang via PlayerDB, skins via Crafatar. Mojang removed the public name-history API in 2022; use NameMC for history.')
+    ], 'Java Edition');
+
+    panel(out, 'Skin & community pivots', () => [
+      linkGrid([
+        { t: 'NameMC profile', u: `https://namemc.com/profile/${enc(player.username)}`, d: 'History, skins, capes, servers' },
+        { t: 'LABY.net', u: `https://laby.net/@${enc(player.username)}`, d: 'Name history & cosmetics' },
+        { t: 'Download skin (PNG)', u: `https://crafatar.com/skins/${enc(raw)}`, d: 'Crafatar' },
+        { t: 'Hypixel stats', u: `https://plancke.io/hypixel/player/stats/${enc(player.username)}`, d: 'Server statistics' },
+        { t: 'Intelligence X', u: `https://intelx.io/?s=${enc(player.username)}`, d: 'Leaks & pastes' }
+      ]),
+      h('div', { class: 'actions' }, h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => ctx.pivot('username', player.username) }, 'Run username analysis on this name →'))
+    ], 'Pivots', true);
+
+    panel(out, 'Public mention search', () => [
+      note('Search operators for finding where this username is publicly used (profiles, servers, forums, videos).'),
+      linkGrid([
+        { t: 'Google — Minecraft mentions', u: gsearch(`"${player.username}" minecraft`), d: 'Exact username + game' },
+        { t: 'Google — social platforms', u: gsearch(`"${player.username}" (site:reddit.com OR site:youtube.com OR site:x.com OR site:twitch.tv OR site:github.com)`), d: 'Cross-platform usage' },
+        { t: 'Google — servers & forums', u: gsearch(`"${player.username}" (hypixel OR mineplex OR "minecraft server" OR "minecraft forum")`), d: 'Community footprint' },
+        { t: 'Google — NameMC', u: gsearch(`site:namemc.com "${player.username}"`), d: 'Related NameMC pages' }
+      ]),
+      src('Only public mentions are searched. Credential or password lookups are deliberately not part of this tool.')
+    ], 'Dorks', true);
   }
 
   /* =====================================================================
-     MODULE: Minecraft
+     Tool: Email Analysis + Breaches
      ===================================================================== */
-  function runMinecraft(ctx, q) {
-    const tasks = [];
-    let profilePromise = (async () => {
-      try {
-        const res = await ctx.json(`https://playerdb.co/api/player/minecraft/${enc(q.value)}`, { timeout: 12000 });
-        return res && res.success && res.data && res.data.player ? res.data.player : null;
-      } catch (err) {
-        if (err.data && err.data.success === false) return null;
-        if (err.status === 400 || err.status === 404) return null;
-        throw err;
-      }
-    })();
-    profilePromise.catch(() => {});
+  const FREE_MAIL = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'yahoo.com', 'icloud.com', 'me.com', 'proton.me', 'protonmail.com', 'aol.com', 'gmx.com', 'gmx.net', 'mail.com', 'zoho.com', 'yandex.com', 'yandex.ru', 'fastmail.com', 'tuta.com', 'tutanota.com', 'libero.it', 'virgilio.it']);
+  const DISPOSABLE = new Set(['mailinator.com', 'guerrillamail.com', '10minutemail.com', 'tempmail.com', 'temp-mail.org', 'yopmail.com', 'trashmail.com', 'throwawaymail.com', 'sharklasers.com', 'getnada.com', 'dispostable.com', 'maildrop.cc', 'mailnesia.com', 'fakeinbox.com', 'moakt.com', 'tmpmail.org']);
 
-    tasks.push(ctx.task('Profile (Mojang)', async (card) => {
-      const pl = await profilePromise;
-      if (!pl) {
-        card.empty(q.kind === 'uuid'
-          ? 'No Java Edition account uses this UUID.'
-          : `No Java Edition account uses the name "${q.value}". It may be available, or the account may have been deleted.`, 'Not found');
-        return;
-      }
-      const raw = pl.raw_id || String(pl.id || '').replace(/-/g, '');
-      const img = (src, w, label) => h('img', { src, alt: label, width: w, height: w, loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.target.remove() });
-      card.ok([
-        h('div', { class: 'avatars' },
-          img(`https://mc-heads.net/avatar/${enc(raw)}/96`, 96, `${pl.username} head`),
-          h('img', { src: `https://mc-heads.net/body/${enc(raw)}/140`, alt: `${pl.username} full skin`, height: 140, loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.target.remove() })),
-        kv([
-          ['Username', pl.username],
-          ['UUID', h('code', null, pl.id)],
-          ['UUID (no dashes)', h('code', null, raw)],
-        ]),
-        h('div', { class: 'chips' },
-          extLink('Download skin', `https://mc-heads.net/download/${enc(raw)}`),
-          extLink('Session profile (JSON)', `https://sessionserver.mojang.com/session/minecraft/profile/${enc(raw)}`)),
-      ], 'Premium account');
-    }));
+  async function sha256hex(s) {
+    if (!(window.crypto && crypto.subtle)) throw new Error('Hashing is unavailable in this context (a secure origin such as https:// or localhost is required).');
+    const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+    return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
+  }
+  const imgExists = src => new Promise(res => { const i = new Image(); const t = setTimeout(() => res(false), 8000); i.onload = () => { clearTimeout(t); res(true); }; i.onerror = () => { clearTimeout(t); res(false); }; i.src = src; });
 
-    tasks.push(ctx.task('Name history & cosmetics', async (card) => {
-      const pl = await profilePromise;
-      if (!pl) { card.empty('Nothing to show because no matching account was found.'); return; }
-      let a;
-      try {
-        a = await ctx.json(`https://api.ashcon.app/mojang/v2/user/${enc(pl.username)}`, { timeout: 12000 });
-      } catch (err) {
-        if (err.status === 404) { card.empty('No extended profile data is cached for this account.'); return; }
-        throw err;
-      }
-      const hist = Array.isArray(a.username_history) ? a.username_history : [];
-      const tex = a.textures || {};
-      card.ok([
-        kv([
-          ['Account created', a.created_at ? fmtDate(a.created_at) : ''],
-          ['Skin model', tex.slim === true ? 'Slim (Alex)' : tex.slim === false ? 'Classic (Steve)' : ''],
-          ['Cape', tex.cape ? 'Has a cape' : 'No cape'],
-        ]),
-        hist.length > 1
-          ? h('div', { class: 'records' }, hist.map((e, i) => h('div', { class: 'rec' },
-            h('span', { class: 'tag' }, i === 0 ? 'first' : `#${i + 1}`),
-            h('ul', null, h('li', null, e.username, h('small', null, e.changed_at ? fmtDate(e.changed_at) : 'original name'))))))
-          : mutedP('No previous names on record.'),
-        mutedP('Mojang removed its public name-history endpoint in 2022, so only names cached by third parties appear. NameMC is the most complete source.'),
-      ], hist.length > 1 ? `${hist.length} names` : 'Loaded');
-    }));
+  async function breachPanel(email) {
+    const r = await fetchStatus(`https://api.xposedornot.com/v1/check-email/${enc(email)}`, { timeout: 15000 });
+    if (r.status === 429) throw new Error('Rate limit reached for XposedOrNot. Try again in a minute.');
+    if (r.status === 404) return [h('div', { class: 'stat' }, h('b', { text: '0' }), h('span', { text: 'known breaches' })), note('This address was not found in the breach corpus indexed by XposedOrNot. That is encouraging, but not a guarantee.'), src('Source: XposedOrNot. The address is sent to xposedornot.com to perform this check.')];
+    if (r.status !== 200 || !r.data) throw new Error(`The breach service answered with HTTP ${r.status}.`);
+    const list = [...new Set((r.data.breaches || []).flat(Infinity).filter(x => typeof x === 'string'))];
+    if (!list.length) return [h('div', { class: 'stat' }, h('b', { text: '0' }), h('span', { text: 'known breaches' })), src('Source: XposedOrNot')];
+    return [h('div', { class: 'stat' }, h('b', { text: String(list.length) }), h('span', { text: `breach${list.length === 1 ? '' : 'es'} include this address` })),
+      chips(list),
+      note('If you own this address: change the password on those services, make every password unique, and enable multi-factor authentication.'),
+      src('Source: XposedOrNot. The address is sent to xposedornot.com to perform this check.')];
+  }
 
-    tasks.push(ctx.task('NameMC & community profiles', async (card) => {
-      const pl = await profilePromise;
-      const name = pl ? pl.username : q.value;
-      const links = [
-        ['NameMC profile', `https://namemc.com/profile/${enc(name)}`],
-        ['NameMC search', `https://namemc.com/search?q=${enc(name)}`],
-        ['Laby.net', `https://laby.net/@${enc(name)}`],
-        ['Crafty.gg', `https://crafty.gg/@${enc(name)}`],
-        ['Hypixel stats', `https://plancke.io/hypixel/player/stats/${enc(name)}`],
-        ['MCSR Ranked', `https://mcsrranked.com/stats/${enc(name)}`],
-      ];
-      card.ok([
-        linkChips(links),
-        q.kind === 'name' || pl ? h('div', { class: 'chips' },
-          h('button', { class: 'link', type: 'button', onclick: () => openTool('username', name, true) }, `Run Username Analysis for "${name}"`)) : null,
-        mutedP('NameMC has no free public API, so these open its pages directly (it also shows servers, friends and skin history).'),
-      ], 'Links');
-    }));
+  async function runEmail(input, out, ctx) {
+    const em = input.trim().toLowerCase();
+    if (!isEmail(em)) throw new Error('Enter a valid email address such as name@example.com.');
+    const at = em.lastIndexOf('@');
+    const local = em.slice(0, at), domain = em.slice(at + 1);
+    const gm = domain === 'gmail.com' || domain === 'googlemail.com';
+    const plus = local.includes('+');
 
-    tasks.push(ctx.task('Google dorks', async (card) => {
-      const pl = await profilePromise;
-      const n = pl ? pl.username : q.value;
-      card.ok([
-        mutedP('Find where this player appears across forums, servers, videos and social media.'),
-        dorksList([
-          `"${n}" minecraft`,
-          `"${n}" site:namemc.com OR site:laby.net`,
-          `"${n}" (minecraft OR hypixel) site:reddit.com`,
-          `"${n}" minecraft site:youtube.com OR site:twitch.tv`,
-          `"${n}" (minecraft OR mc) discord`,
-          `"${n}" minecraft (ban OR banned OR appeal OR griefer) -site:namemc.com`,
-          `"${n}" site:twitter.com OR site:x.com OR site:github.com`,
-          `inurl:"${n}" minecraft`,
-        ]),
-      ], 'Ready');
-    }));
+    panel(out, 'Address analysis', () => [kv([
+      ['Local part', local, true], ['Domain', domain, true],
+      ['Provider type', DISPOSABLE.has(domain) ? 'Disposable / temporary mailbox' : FREE_MAIL.has(domain) ? 'Free public mailbox provider' : 'Custom or corporate domain'],
+      ['Sub-address tag', plus ? `+${local.split('+')[1]} (alias of ${local.split('+')[0]}@${domain})` : ''],
+      ['Canonical Gmail form', gm ? `${local.split('+')[0].replace(/\./g, '')}@gmail.com` : '']
+    ]), h('div', { class: 'actions' },
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => ctx.pivot('username', local.split('+')[0]) }, `Run username analysis on “${local.split('+')[0]}” →`),
+      FREE_MAIL.has(domain) || DISPOSABLE.has(domain) ? null : h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => ctx.pivot('domain', domain) }, `Analyze domain ${domain} →`)),
+    src('Disposable and free-provider lists are a small built-in sample, not exhaustive.')], domain);
 
-    tasks.push(intelxTask(ctx, q.kind === 'uuid' ? q.value : q.value));
-    return Promise.all(tasks);
+    panel(out, 'Mail infrastructure', async () => {
+      const [mx, txt, dm] = await Promise.allSettled([doh(domain, 'MX'), doh(domain, 'TXT'), doh(`_dmarc.${domain}`, 'TXT')]);
+      if (mx.status === 'rejected') throw new Error('DNS-over-HTTPS resolvers could not be reached.');
+      const mxs = mx.value.answers.filter(a => a.type === 'MX').map(a => a.data);
+      const t = x => x.status === 'fulfilled' ? x.value.answers.filter(a => a.type === 'TXT').map(a => a.data) : [];
+      return [kv([
+        ['Receives email', mxs.length ? '✓ MX records published' : '✗ No MX records — the domain may not accept mail'],
+        ['Mail servers', mxs, true],
+        ['SPF', t(txt).filter(x => /^v=spf1/i.test(x)).join(' ') || 'Not published', true],
+        ['DMARC', t(dm).filter(x => /^v=DMARC1/i.test(x)).join(' ') || 'Not published', true]
+      ]), src('Source: Cloudflare / Google DNS-over-HTTPS')];
+    });
+
+    panel(out, 'Gravatar', async () => {
+      const hash = await sha256hex(em);
+      const url = `https://gravatar.com/avatar/${hash}?s=160&d=404`;
+      return (await imgExists(url))
+        ? [h('div', { class: 'mc' }, h('img', { class: 'avatar', src: url, alt: 'Gravatar avatar', width: 96, height: 96 })), note('A Gravatar is registered for this address. The picture is public and was chosen by the owner.'), linkGrid([{ t: 'Gravatar profile', u: `https://gravatar.com/${hash}`, d: 'May list linked accounts' }])]
+        : 'No public Gravatar is registered for this address.';
+    });
+
+    panel(out, 'Data breach exposure', () => breachPanel(em), 'XposedOrNot');
+
+    panel(out, 'Pivot to other sources', () => linkGrid([
+      { t: 'Have I Been Pwned', u: `https://haveibeenpwned.com/account/${enc(em)}`, d: 'Breach lookup' },
+      { t: 'Intelligence X', u: `https://intelx.io/?s=${enc(em)}`, d: 'Leaks & pastes' },
+      { t: 'Epieos', u: `https://epieos.com/?q=${enc(em)}&t=email`, d: 'Linked-account lookup' },
+      { t: 'Google — exact', u: gsearch(`"${em}"`), d: 'Public mentions' },
+      { t: 'Google — code & pastes', u: gsearch(`"${em}" (site:github.com OR site:pastebin.com OR site:gitlab.com)`), d: 'Commits and pastes' },
+      { t: 'DeHashed', u: `https://dehashed.com/search?query=${enc(em)}`, d: 'Leak search (account may be required)' }
+    ]), 'Pivots', true);
+  }
+
+  async function runBreaches(input, out, ctx) {
+    const v = input.trim();
+    if (!v) throw new Error('Enter a username or an email address.');
+    if (v.includes('@')) {
+      const em = v.toLowerCase();
+      if (!isEmail(em)) throw new Error('That looks like an email address but is not valid.');
+      panel(out, `Breach exposure · ${em}`, () => breachPanel(em), 'XposedOrNot', true);
+    } else {
+      if (!/^[\w.\-]{1,40}$/.test(v)) throw new Error('Usernames can contain letters, numbers, dots, dashes and underscores (max 40 characters).');
+      panel(out, 'How username breach checks work', () => [
+        note('Free, keyless APIs index breaches by email address; usernames are only searchable in commercial or account-gated leak indexes. So the honest approach is to search public leak indexes and open-web pastes yourself using the links below.'),
+        note('Tip: if you know an email address associated with this username, paste it here instead for a direct breach lookup.')
+      ], 'Info', true);
+      panel(out, 'Leak indexes', () => linkGrid([
+        { t: 'Intelligence X', u: `https://intelx.io/?s=${enc(v)}`, d: 'Free tier: pastes, leaks, documents' },
+        { t: 'Have I Been Pwned', u: 'https://haveibeenpwned.com/', d: 'Breach list & email search' },
+        { t: 'DeHashed', u: `https://dehashed.com/search?query=${enc(v)}`, d: 'Account may be required' },
+        { t: 'LeakCheck', u: 'https://leakcheck.io/', d: 'Leak search' },
+        { t: 'BreachDirectory', u: 'https://breachdirectory.org/', d: 'Public breach search' },
+        { t: 'XposedOrNot', u: 'https://xposedornot.com/', d: 'Free breach database' }
+      ]), 'Pivots', true);
+      panel(out, 'Public paste & code search', () => linkGrid([
+        { t: 'Pastebin mentions', u: gsearch(`site:pastebin.com "${v}"`), d: 'Google dork' },
+        { t: 'GitHub code & gists', u: gsearch(`"${v}" (site:github.com OR site:gist.github.com)`), d: 'Google dork' },
+        { t: 'Paste sites (broad)', u: gsearch(`"${v}" (site:pastebin.com OR site:paste.ee OR site:justpaste.it OR site:rentry.co OR site:controlc.com)`), d: 'Google dork' },
+        { t: 'Hacker forums & dumps (mentions)', u: gsearch(`"${v}" ("data breach" OR "leaked database" OR "combo list")`), d: 'Context search' },
+        { t: 'GitHub code search', u: `https://github.com/search?q=${enc(`"${v}"`)}&type=code`, d: 'Requires GitHub sign-in' }
+      ]), 'Dorks', true);
+    }
+    panel(out, 'What to do if exposed', () => h('ul', { class: 'note', style: 'margin:0;padding-left:18px' },
+      ['Change the password on the affected service and anywhere it was reused.', 'Use a password manager to give every account a unique password.', 'Enable multi-factor authentication (an authenticator app or a security key).', 'Watch for phishing that references the breached service.'].map(t => h('li', { text: t }))), 'Defensive', true);
   }
 
   /* =====================================================================
      Tool registry
      ===================================================================== */
+  const ICONS = {
+    user: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.2 3 14.8 0 18M12 3c-3 3.2-3 14.8 0 18"/></svg>',
+    domain: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg>',
+    phone: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18h2"/></svg>',
+    cube: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12L3 7M12 12v10"/></svg>',
+    mail: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>',
+    shield: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.4 8.2-8 9-4.6-.8-8-4-8-9V6z"/><path d="M12 8v5M12 16h.01"/></svg>'
+  };
+
   const TOOLS = [
-    {
-      id: 'username', title: 'Username Analysis',
-      blurb: 'Find where a handle exists across developer, social and gaming platforms, with ready-made Google dorks.',
-      desc: 'Checks public profile APIs, builds Google dorks and links to username databases and IntelX.',
-      icon: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-7 8-7s8 3 8 7"/>',
-      placeholder: 'Enter a username', hint: '2 to 40 characters: letters, numbers, . _ -', example: 'torvalds',
-      normalize(v) {
-        const s = v.trim().replace(/^@/, '');
-        if (!/^[A-Za-z0-9._-]{2,40}$/.test(s)) throw new Error('Enter a username of 2 to 40 characters using letters, numbers, dots, underscores or hyphens.');
-        return s;
-      },
-      run: runUsername,
-    },
-    {
-      id: 'ip', title: 'IP/DNS Analysis',
-      blurb: 'Geolocation, ASN, reverse DNS, open ports and CVEs for an IP address, or full DNS for a hostname.',
-      desc: 'Uses ipinfo.io, Shodan InternetDB, DNS over HTTPS and IntelX. Hostnames are resolved first.',
-      icon: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/>',
-      placeholder: 'IPv4, IPv6 or hostname', hint: 'For example an IP address or www.example.com', example: '1.1.1.1',
-      normalize(v) {
-        let s = v.trim();
-        if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
-        if (isIPv4(s) || isIPv6(s)) return { kind: 'ip', value: s.toLowerCase() };
-        return { kind: 'host', value: normalizeDomain(s) };
-      },
-      run: runIp,
-    },
-    {
-      id: 'domain', title: 'Domain Analysis',
-      blurb: 'DNS records, RDAP registration data, subdomains from certificates, email security and archive history.',
-      desc: 'Combines DNS over HTTPS, RDAP, Certificate Transparency, Wayback Machine, Google dorks and IntelX.',
-      icon: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/>',
-      placeholder: 'example.com', hint: 'A domain or URL; the protocol and path are ignored', example: 'wikipedia.org',
-      normalize: normalizeDomain,
-      run: runDomain,
-    },
-    {
-      id: 'phone', title: 'Phone Number Analysis',
-      blurb: 'Validate and parse a number offline-style, then pivot to dorks, messaging apps and caller databases.',
-      desc: 'Parses the number with libphonenumber, then builds Google dorks and lookup links. Use international format.',
-      icon: '<rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18h2"/>',
-      placeholder: '+44 7700 900123', hint: 'International format with the country code, starting with +', example: '+44 7700 900123',
-      normalize(v) {
-        let s = v.trim().replace(/[\s().-]/g, '');
-        if (s.startsWith('00')) s = `+${s.slice(2)}`;
-        if (!/^\+[1-9]\d{5,14}$/.test(s)) throw new Error('Use international format with the country code, for example +39 312 345 6789.');
-        return s;
-      },
-      run: runPhone,
-    },
-    {
-      id: 'minecraft', title: 'Minecraft Account Analysis',
-      blurb: 'Resolve a Java Edition username or UUID, view skins and history, and pivot to NameMC and dorks.',
-      desc: 'Uses PlayerDB (Mojang data) and Ashcon for history, plus NameMC links and Google dorks.',
-      icon: '<path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12L3 7M12 12v10"/>',
-      placeholder: 'Java username or UUID', hint: '3 to 16 characters (letters, numbers, _) or a UUID', example: 'jeb_',
-      normalize(v) {
-        const s = v.trim();
-        const compact = s.replace(/-/g, '');
-        if (/^[0-9a-f]{32}$/i.test(compact) && /^[0-9a-f-]{32,36}$/i.test(s)) return { kind: 'uuid', value: compact.toLowerCase() };
-        if (!/^[A-Za-z0-9_]{3,16}$/.test(s)) throw new Error('Enter a Java username (3 to 16 letters, numbers or underscores) or a 32-character UUID.');
-        return { kind: 'name', value: s };
-      },
-      run: runMinecraft,
-    },
+    { id: 'username', title: 'Username Analysis', icon: 'user', blurb: 'Find where a handle is registered across developer, social and gaming platforms.',
+      desc: 'Checks live public APIs for matching accounts, then gives you verification links and search pivots for everything else.',
+      placeholder: 'e.g. torvalds', hint: 'Letters, numbers, dots, dashes and underscores.', examples: ['torvalds', 'gvanrossum'], run: runUsername },
+    { id: 'ip', title: 'IP/DNS Analysis', icon: 'globe', blurb: 'Geolocation, ASN, reverse DNS and full DNS records for an IP or hostname.',
+      desc: 'Enter an IPv4/IPv6 address or a hostname. Hostnames are resolved first, then the first address is analyzed.',
+      placeholder: 'e.g. 1.1.1.1 or example.com', hint: 'IPv4, IPv6, hostname or domain.', examples: ['1.1.1.1', '8.8.8.8', 'github.com'], run: runIPDNS },
+    { id: 'domain', title: 'Domain Analysis', icon: 'domain', blurb: 'WHOIS/RDAP, DNS, email security, subdomains, scans and web archive.',
+      desc: 'Profiles a domain from registration data, certificate transparency logs, DNS and public scan history.',
+      placeholder: 'e.g. example.com', hint: 'You can paste a full URL — the host is extracted.', examples: ['example.com', 'wikipedia.org'], run: runDomain },
+    { id: 'phone', title: 'Phone Number Analysis', icon: 'phone', learn: true, blurb: 'Validate, normalize and pivot on a phone number.',
+      desc: 'Parses any phone number offline, identifies region and line type, and builds search variations and caller-ID pivots.',
+      placeholder: 'e.g. +1 415 555 2671', hint: 'Use international format (+ and country code) or pick a default country.', examples: ['+14155552671', '+442071838750'], extra: 'region', run: runPhone, after: PHONE_LEARN },
+    { id: 'minecraft', title: 'Minecraft Account Analysis', icon: 'cube', blurb: 'Resolve a Java username or UUID to its profile, skin and public footprint.',
+      desc: 'Looks up the Mojang profile, shows skin renders and links to NameMC, LABY.net and public mention searches.',
+      placeholder: 'e.g. Notch or a UUID', hint: 'Java Edition usernames: 3–16 characters. UUIDs also accepted.', examples: ['Notch', 'jeb_'], run: runMinecraft },
+    { id: 'email', title: 'Email Analysis', icon: 'mail', blurb: 'Inspect address type, mail setup, Gravatar and known breach exposure.',
+      desc: 'Analyzes an email address using DNS, Gravatar and the free XposedOrNot breach database.',
+      placeholder: 'e.g. name@example.com', hint: 'The address is only sent to the services named in each result card.', examples: [], run: runEmail },
+    { id: 'breach', title: 'Username Analysis in Public Data Breaches', icon: 'shield', blurb: 'Check whether an identity shows up in public leaks and pastes.',
+      desc: 'Email addresses get a direct breach lookup. Usernames get leak-index and paste-site search pivots.',
+      placeholder: 'e.g. username or name@example.com', hint: 'Emails use XposedOrNot; usernames use public leak indexes and dorks.', examples: [], run: runBreaches }
   ];
+  const toolById = id => TOOLS.find(t => t.id === id);
 
   /* =====================================================================
-     App shell: views, navigation, tool form
+     Navigation & views
      ===================================================================== */
-  const views = { splash: $('#view-splash'), menu: $('#view-menu'), tool: $('#view-tool') };
-  const els = {
-    form: $('#tool-form'), input: $('#tool-input'), run: $('#tool-run'), error: $('#tool-error'), results: $('#results-host'),
-    title: $('#tool-title'), desc: $('#tool-desc'), hint: $('#tool-hint'), example: $('#tool-example'),
-    grid: $('#menu-grid'), dialog: $('#settings'),
-  };
-  let current = 'splash';
-  let navToken = 0;
-  let activeTool = null;
+  const screens = { intro: $('#intro'), menu: $('#menu'), tool: $('#tool') };
+  let current = 'intro';
 
   function show(name) {
-    if (name === current) return Promise.resolve();
-    const token = ++navToken;
-    const from = views[current];
-    const to = views[name];
-    from.classList.remove('active');
-    from.classList.add('leaving');
-    return sleep(reduceMotion ? 0 : 260).then(() => {
-      if (token !== navToken) return;
-      for (const [key, v] of Object.entries(views)) {
-        v.classList.remove('active', 'leaving');
-        v.hidden = key !== name;
+    current = name;
+    Object.entries(screens).forEach(([k, el]) => {
+      const on = k === name;
+      el.classList.toggle('active', on);
+      if (on) el.removeAttribute('inert'); else el.setAttribute('inert', '');
+      el.setAttribute('aria-hidden', on ? 'false' : 'true');
+    });
+  }
+
+  let routed = '';
+  function route(hash) {
+    hash = hash || '';
+    if (hash === routed) return;
+    routed = hash;
+    const p = new URLSearchParams(hash.replace(/^#/, ''));
+    if (hash === '#menu') { show('menu'); }
+    else if (p.get('tool') && toolById(p.get('tool'))) { renderTool(toolById(p.get('tool')), p.get('v') || ''); show('tool'); }
+    else show('intro');
+  }
+
+  function go(hash) {
+    hash = hash || '';
+    if (location.hash !== hash) {
+      // The History API can throw on file:// pages; fall back to the hash, then to plain in-memory routing.
+      try { history.pushState(null, '', hash || (location.pathname + location.search)); }
+      catch { try { location.hash = hash; } catch { /* ignore */ } }
+    }
+    route(hash);
+    const sc = $('.screen.active .screen-scroll'); if (sc) sc.scrollTo({ top: 0, behavior: 'auto' });
+  }
+  window.addEventListener('popstate', () => route(location.hash));
+  window.addEventListener('hashchange', () => route(location.hash));
+
+  function pivot(id, value) { go(`#tool=${id}&v=${enc(value)}`); }
+
+  /* ----- Intro ----- */
+  (function buildLogo() {
+    const box = $('.letters');
+    [...'osintnow'].forEach((c, i) => box.append(h('span', { class: 'ch', style: `animation-delay:${.25 + i * .07}s`, text: c })));
+    box.append(h('span', { class: 'ch dot', style: `animation-delay:${.25 + 8 * .07}s`, text: '.' }));
+  })();
+
+  $('#launch').addEventListener('click', () => go('#menu'));
+  $('#brand-home').addEventListener('click', () => go(''));
+
+  /* ----- Menu ----- */
+  const grid = $('#menu-grid');
+  TOOLS.forEach((t, i) => {
+    const b = h('button', { class: 'card-btn', type: 'button', role: 'listitem', style: `--i:${i}`, 'aria-label': t.title, onclick: () => go(`#tool=${t.id}`) },
+      h('span', { class: 'card-ico', 'aria-hidden': 'true' }),
+      h('h3', { text: t.title }), h('p', { text: t.blurb }),
+      h('span', { class: 'card-foot' }, h('span', { class: t.learn ? 'learn' : '', text: t.learn ? 'Learn more inside' : 'Open module' }), h('span', { class: 'arrow', 'aria-hidden': 'true', text: '→' })));
+    b.querySelector('.card-ico').innerHTML = ICONS[t.icon]; // static, trusted markup
+    b.addEventListener('pointermove', e => { const r = b.getBoundingClientRect(); b.style.setProperty('--mx', `${e.clientX - r.left}px`); b.style.setProperty('--my', `${e.clientY - r.top}px`); });
+    grid.append(b);
+  });
+
+  /* ----- Tool view ----- */
+  const toolRoot = $('#tool-root');
+  let runId = 0;
+
+  function renderTool(tool, preset) {
+    runId++;
+    const ico = h('div', { class: 'tool-ico', 'aria-hidden': 'true' });
+    ico.innerHTML = ICONS[tool.icon]; // static, trusted markup
+
+    const input = h('input', { type: 'text', id: 'q', name: 'q', placeholder: tool.placeholder, autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'aria-label': tool.title + ' input', required: true });
+    input.value = preset || '';
+    let select = null;
+    if (tool.extra === 'region') {
+      select = h('select', { 'aria-label': 'Default country', title: 'Default country (used when the number has no + prefix)' }, h('option', { value: '', text: 'Default country: auto' }));
+      const lib = window.libphonenumber;
+      if (lib && lib.getCountries) {
+        lib.getCountries().map(c => ({ c, n: regionName(c) })).sort((a, b) => a.n.localeCompare(b.n)).forEach(({ c, n }) => select.append(h('option', { value: c, text: `${flag(c)} ${n} (+${lib.getCountryCallingCode(c)})` })));
       }
-      to.classList.add('active');
-      current = name;
-      document.body.dataset.view = name;
-      window.scrollTo(0, 0);
-      to.focus({ preventScroll: true });
+    }
+    const btn = h('button', { class: 'btn btn-primary', type: 'submit' }, 'Analyze');
+    const results = h('div', { class: 'results', 'aria-live': 'polite' });
+    const resWrap = h('div', {});
+
+    const form = h('form', { class: 'form', novalidate: true }, input, select, btn);
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      const value = input.value.trim();
+      if (!value) { input.focus(); return; }
+      const my = ++runId;
+      const out = h('div', { class: 'results', 'aria-live': 'polite' });
+      const copy = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: async () => {
+        try { await navigator.clipboard.writeText(`${tool.title}: ${value}\n\n${out.innerText}`); copy.textContent = 'Copied ✓'; } catch { copy.textContent = 'Copy failed'; }
+        setTimeout(() => { copy.textContent = 'Copy results'; }, 1800);
+      } }, 'Copy results');
+      resWrap.replaceChildren(h('div', { class: 'results-bar' }, h('span', { text: `Results · ${value.slice(0, 60)}` }), copy), out);
+      btn.disabled = true; btn.replaceChildren(h('span', { class: 'spin' }), 'Analyzing');
+      resWrap.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+      try {
+        await tool.run(value, out, { extra: select ? select.value : '', pivot });
+        await Promise.allSettled(out._p || []);
+      } catch (err) {
+        out.append(h('article', { class: 'card wide' }, h('header', { class: 'card-h' }, h('h3', { text: 'Input problem' })), h('div', { class: 'body' }, h('p', { class: 'err', text: `⚠ ${err.message || 'Something went wrong.'}` }))));
+      } finally {
+        if (my === runId) { btn.disabled = false; btn.textContent = 'Analyze'; }
+      }
     });
+
+    const examples = tool.examples && tool.examples.length
+      ? h('div', { class: 'examples' }, 'Try:', tool.examples.map(x => h('button', { type: 'button', text: x, onclick: () => { input.value = x; form.requestSubmit(); } })))
+      : null;
+
+    toolRoot.replaceChildren(...[
+      h('div', { class: 'tool-top' }, h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => go('#menu') }, '← All modules')),
+      h('div', { class: 'tool-head' }, ico, h('div', {}, h('h2', { text: tool.title }), h('p', { text: tool.desc }))),
+      form, h('p', { class: 'hint', text: tool.hint }), examples,
+      tool.after ? tool.after() : null,
+      resWrap].filter(Boolean));
+    setTimeout(() => input.focus({ preventScroll: true }), 250);
+    if (preset) setTimeout(() => form.requestSubmit(), 350);
   }
 
-  function cancelRun() {
-    if (currentRun) { currentRun.ctrl.abort(); currentRun = null; }
-    els.run.classList.remove('busy');
-  }
+  /* ----- Settings ----- */
+  const dlg = $('#settings');
+  $('#open-settings').addEventListener('click', () => { $('#ipinfo-token').value = store.get('osintnow.ipinfo'); if (dlg.showModal) dlg.showModal(); });
+  $('#settings-form').addEventListener('submit', e => {
+    if (e.submitter && e.submitter.value === 'save') store.set('osintnow.ipinfo', $('#ipinfo-token').value.trim());
+  });
+  dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
 
-  function configureTool(tool) {
-    cancelRun();
-    activeTool = tool;
-    els.title.textContent = tool.title;
-    els.desc.textContent = tool.desc;
-    els.input.value = '';
-    els.input.placeholder = tool.placeholder;
-    els.hint.textContent = tool.hint;
-    els.example.textContent = `Try: ${tool.example}`;
-    els.error.hidden = true;
-    els.results.replaceChildren();
-    if (current === 'tool') {
-      const v = views.tool;
-      v.classList.remove('active');
-      void v.offsetWidth;
-      v.classList.add('active');
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !dlg.open) {
+      if (current === 'tool') go('#menu');
     }
-  }
+  });
 
-  function render(state) {
-    if (state.view === 'tool') {
-      const tool = TOOLS.find((t) => t.id === state.tool);
-      if (!tool) return render({ view: 'menu' });
-      configureTool(tool);
-      return show('tool').then(() => { if (current === 'tool') els.input.focus({ preventScroll: true }); });
+  /* =====================================================================
+     Animated background (network of drifting nodes)
+     ===================================================================== */
+  (function background() {
+    const cv = $('#bg'); const ctx = cv.getContext('2d');
+    let w, h2, dpr, pts = [], raf = 0, mouse = { x: -999, y: -999 };
+    const N = () => Math.min(80, Math.floor((w * h2) / 18000));
+    function resize() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      w = window.innerWidth; h2 = window.innerHeight;
+      cv.width = w * dpr; cv.height = h2 * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const n = N();
+      while (pts.length < n) pts.push({ x: Math.random() * w, y: Math.random() * h2, vx: (Math.random() - .5) * .28, vy: (Math.random() - .5) * .28, r: Math.random() * 1.4 + .6 });
+      pts.length = n;
+      if (reduceMotion) draw();
     }
-    cancelRun();
-    return show(state.view);
-  }
-
-  function navigate(view, tool) {
-    const state = { view, tool: tool || null };
-    try { history.pushState(state, ''); } catch { /* history unavailable */ }
-    return render(state);
-  }
-
-  function openTool(id, value, autorun) {
-    navigate('tool', id);
-    if (value) {
-      els.input.value = value;
-      if (autorun) runAnalysis();
+    function draw() {
+      ctx.clearRect(0, 0, w, h2);
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        if (!reduceMotion) {
+          a.x += a.vx; a.y += a.vy;
+          if (a.x < -20) a.x = w + 20; else if (a.x > w + 20) a.x = -20;
+          if (a.y < -20) a.y = h2 + 20; else if (a.y > h2 + 20) a.y = -20;
+        }
+        ctx.fillStyle = 'rgba(255,255,255,.55)';
+        ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, 6.2832); ctx.fill();
+        for (let j = i + 1; j < pts.length; j++) {
+          const b = pts[j]; const dx = a.x - b.x, dy = a.y - b.y; const d = dx * dx + dy * dy;
+          if (d < 19600) { ctx.strokeStyle = `rgba(255,255,255,${(1 - d / 19600) * .16})`; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
+        }
+        const mx = a.x - mouse.x, my = a.y - mouse.y, md = mx * mx + my * my;
+        if (md < 22500) { ctx.strokeStyle = `rgba(255,255,255,${(1 - md / 22500) * .35})`; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(mouse.x, mouse.y); ctx.stroke(); }
+      }
     }
-  }
+    function loop() { draw(); raf = requestAnimationFrame(loop); }
+    window.addEventListener('resize', resize);
+    window.addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; }, { passive: true });
+    window.addEventListener('pointerleave', () => { mouse.x = mouse.y = -999; });
+    document.addEventListener('visibilitychange', () => { if (reduceMotion) return; if (document.hidden) cancelAnimationFrame(raf); else raf = requestAnimationFrame(loop); });
+    resize();
+    if (!reduceMotion) raf = requestAnimationFrame(loop);
+  })();
 
-  window.addEventListener('popstate', (e) => { render(e.state || { view: 'splash' }); });
-
-  function showError(msg) {
-    els.error.textContent = msg;
-    els.error.hidden = false;
-    els.error.style.animation = 'none';
-    void els.error.offsetWidth;
-    els.error.style.animation = '';
-    els.input.focus();
-  }
-
-  async function runAnalysis() {
-    if (!activeTool) return;
-    let q;
-    try { q = activeTool.normalize(els.input.value); } catch (err) { showError(err.message); return; }
-    els.error.hidden = true;
-    cancelRun();
-    const run = { id: ++runSeq, ctrl: new AbortController() };
-    currentRun = run;
-    els.run.classList.add('busy');
-    els.results.replaceChildren();
-    const host = h('div', { class: 'results', 'aria-live': 'polite' });
-    els.results.append(host);
-    const ctx = makeCtx(run, host);
-    try {
-      await activeTool.run(ctx, q);
-    } catch (err) {
-      if (ctx.alive()) host.append(h('p', { class: 'form-error' }, explain(err)));
-    } finally {
-      if (currentRun === run) els.run.classList.remove('busy');
-    }
-    if (currentRun === run) {
-      const first = host.firstElementChild;
-      if (first && !reduceMotion) first.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  }
-
-  /* ---------- Settings dialog ---------- */
-  function openSettings() {
-    const s = Settings.get();
-    $('#set-intelx').value = s.intelx;
-    $('#set-intelx-host').value = s.intelxHost;
-    $('#set-ipinfo').value = s.ipinfo;
-    if (typeof els.dialog.showModal === 'function') els.dialog.showModal();
-    else els.dialog.setAttribute('open', '');
-  }
-
-  $('#settings-btn').addEventListener('click', openSettings);
-  $('#settings-cancel').addEventListener('click', () => els.dialog.close());
-  $('#settings-clear').addEventListener('click', () => {
-    for (const k of Object.values(Settings.keys)) Settings.write(k, '');
-    $('#set-intelx').value = '';
-    $('#set-ipinfo').value = '';
-    $('#set-intelx-host').value = 'free.intelx.io';
-  });
-  $('#settings-form').addEventListener('submit', () => {
-    Settings.write(Settings.keys.intelx, $('#set-intelx').value.trim());
-    Settings.write(Settings.keys.intelxHost, $('#set-intelx-host').value);
-    Settings.write(Settings.keys.ipinfo, $('#set-ipinfo').value.trim());
-  });
-  els.dialog.addEventListener('click', (e) => { if (e.target === els.dialog) els.dialog.close(); });
-
-  /* ---------- Menu ---------- */
-  TOOLS.forEach((tool, i) => {
-    const card = h('button', { class: 'menu-card', type: 'button', style: `--i:${i}` },
-      h('span', { class: 'menu-icon' }, svg(tool.icon)),
-      h('h3', null, tool.title),
-      p(tool.blurb),
-      h('span', { class: 'go' }, 'Open module', svg('<path d="M5 12h14M13 6l6 6-6 6"/>', 16)));
-    card.addEventListener('click', () => navigate('tool', tool.id));
-    card.addEventListener('pointermove', (e) => {
-      const r = card.getBoundingClientRect();
-      card.style.setProperty('--mx', `${e.clientX - r.left}px`);
-      card.style.setProperty('--my', `${e.clientY - r.top}px`);
-    });
-    els.grid.append(card);
-  });
-
-  /* ---------- Splash ---------- */
-  [...'osintnow.'].forEach((c, i) => {
-    $('.letters').append(h('span', { class: `letter${c === '.' ? ' dot' : ''}`, style: `--i:${i}` }, c));
-  });
-  $('#start-btn').addEventListener('click', () => navigate('menu'));
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && current === 'splash' && !e.target.closest('button')) navigate('menu');
-  });
-
-  /* ---------- Tool view wiring ---------- */
-  $('#home-btn').addEventListener('click', () => { if (current !== 'menu') navigate('menu'); });
-  $('#back-btn').addEventListener('click', () => navigate('menu'));
-  els.form.addEventListener('submit', (e) => { e.preventDefault(); runAnalysis(); });
-  els.example.addEventListener('click', () => {
-    if (!activeTool) return;
-    els.input.value = activeTool.example;
-    runAnalysis();
-  });
-  els.input.addEventListener('input', () => { els.error.hidden = true; });
-
-  try { history.replaceState({ view: 'splash' }, ''); } catch { /* history unavailable */ }
+  /* ----- Boot: always start on the intro screen ----- */
+  show('intro');
 })();
